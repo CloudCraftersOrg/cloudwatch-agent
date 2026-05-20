@@ -45,10 +45,14 @@ import os
 # tested against other regions during local development if needed.
 REGION: str = os.environ.get("AWS_REGION", "us-west-2")
 
-# Default Bedrock model ID. Uses the cross-region inference profile for
-# Opus 4.6 in the US partition (the ``us.`` prefix), which is the only
-# supported invocation path for the latest Anthropic models on Bedrock.
-MODEL_ID: str = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-4-6-v1")
+# Default Bedrock model ID. Invokes the foundation model DIRECTLY in the
+# runtime's region (no ``us.`` prefix → no cross-region inference profile
+# fan-out), so model access only has to be opted-in for us-west-2. The
+# trade-off is no automatic cross-region failover on throttling. Switch
+# to ``us.anthropic.claude-opus-4-6-v1`` (and re-widen the Bedrock IAM
+# resources + enable model access in us-east-1/us-east-2/us-west-2) if
+# you want the cross-region inference profile's higher quota envelope.
+MODEL_ID: str = os.environ.get("MODEL_ID", "anthropic.claude-opus-4-6-v1")
 
 # AgentCore Memory ID. Optional locally so contributors don't need to
 # provision real AWS resources just to iterate on prompts or tool code.

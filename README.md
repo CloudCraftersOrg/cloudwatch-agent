@@ -61,9 +61,16 @@ and deletes it immediately.
 
 ## Prerequisites
 
-- An AWS account with **Anthropic Claude Opus 4.6 enabled in Bedrock for
-  the `us-west-2` region**. Model access is opt-in per region; without it,
-  every invocation will fail with `AccessDeniedException`.
+- An AWS account with **Anthropic Claude Opus 4.6 enabled in Bedrock**
+  via the AWS Console (Bedrock → Model access) **in every region the
+  cross-region inference profile fans out to: `us-east-1`, `us-east-2`,
+  AND `us-west-2`**. Model access is opt-in per region; enabling it only
+  in `us-west-2` (the runtime's home region) is NOT enough — invocations
+  will land on any of those three regions and fail with
+  `AccessDeniedException ... aws-marketplace:Subscribe` for whichever
+  region is still un-subscribed. The runtime role does NOT have
+  marketplace permissions on purpose (over-broad); the model must be
+  pre-subscribed by a human admin.
 - **AWS IAM Identity Center enabled** in the account in `us-west-2`.
   Amazon Managed Grafana requires it (or SAML) for human login; enabling
   Identity Center is an organization-level action and is intentionally
