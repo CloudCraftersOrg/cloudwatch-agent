@@ -94,16 +94,23 @@ data "aws_iam_policy_document" "runtime_permissions" {
     ]
   }
 
-  # CloudWatch metrics, read-only. Used to discover/inspect metrics when
-  # designing dashboards. Dashboards now live in Grafana, so no
-  # cloudwatch:*Dashboard* permissions are granted. Account-wide because
-  # ListMetrics/GetMetricData do not support resource-level scoping.
+  # CloudWatch metrics + alarms, read-only. Used by the AWS Labs
+  # CloudWatch MCP server (get_metric_data, get_metric_metadata,
+  # get_active_alarms, get_alarm_history, get_recommended_metric_alarms)
+  # and any direct metric inspection. Dashboards now live in Grafana, so
+  # no cloudwatch:*Dashboard* permissions are granted. Account-wide
+  # because the underlying APIs do not support resource-level scoping.
   statement {
     sid    = "CloudWatchMetricsRead"
     effect = "Allow"
     actions = [
       "cloudwatch:ListMetrics",
       "cloudwatch:GetMetricData",
+      "cloudwatch:GetMetricStatistics",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:DescribeAlarmHistory",
+      "cloudwatch:DescribeAlarmsForMetric",
+      "cloudwatch:DescribeAnomalyDetectors",
     ]
     resources = ["*"]
   }
@@ -122,15 +129,33 @@ data "aws_iam_policy_document" "runtime_permissions" {
     resources = [aws_grafana_workspace.this.arn]
   }
 
-  # CloudWatch Logs Insights. Account-scoped at IAM layer; agent decides log groups at runtime.
+  # CloudWatch Logs read. Covers both paths:
+  #   - filter_log_events tool (custom, FilterLogEvents API — bypasses
+  #     Insights so it has no indexing lag).
+  #   - AWS Labs CloudWatch MCP server (describe_log_groups,
+  #     execute_log_insights_query, analyze_log_group,
+  #     get_logs_anomaly_detectors).
+  # Account-scoped at the IAM layer; the agent decides log groups at
+  # runtime (no resource-level scoping is meaningful for the cross-group
+  # describe/list operations).
   statement {
-    sid    = "CloudWatchLogsInsights"
+    sid    = "CloudWatchLogsRead"
     effect = "Allow"
     actions = [
       "logs:DescribeLogGroups",
-      "logs:StartQuery",
+      "logs:DescribeLogStreams",
+      "logs:DescribeMetricFilters",
+      "logs:DescribeQueries",
+      "logs:DescribeQueryDefinitions",
+      "logs:FilterLogEvents",
+      "logs:GetLogEvents",
+      "logs:GetLogGroupFields",
+      "logs:GetLogRecord",
       "logs:GetQueryResults",
+      "logs:StartQuery",
       "logs:StopQuery",
+      "logs:ListLogAnomalyDetectors",
+      "logs:ListAnomalies",
     ]
     resources = ["*"]
   }

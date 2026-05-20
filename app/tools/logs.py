@@ -1,21 +1,29 @@
-"""CloudWatch Logs tools.
+"""CloudWatch Logs tools that BYPASS Logs Insights.
 
-Two tools:
+The agent's primary path for log analytics (describe_log_groups,
+execute_log_insights_query, analyze_log_group, get_logs_anomaly_detectors,
+metric helpers...) goes through the AWS Labs CloudWatch MCP server (see
+``app/mcp_clients.py``). Those tools rely on Logs Insights internally,
+which has indexing lag (minutes for new log groups, especially for a
+backdated burst from the demo seeds).
 
-- ``list_log_groups``: enumerate log groups in the account.
-- ``run_logs_insights_query``: run a Logs Insights query against one or
-  more log groups and return the results.
+This module exposes ONE complementary tool, ``filter_log_events``, that
+uses the FilterLogEvents API directly — the same path the AWS Console's
+"Log events" tab uses. No indexing required; events are visible
+immediately after PutLogEvents. Use this when:
 
-Logs Insights is asynchronous: ``StartQuery`` returns a query ID, and the
-caller must poll ``GetQueryResults`` until the query reports a terminal
-status. We hide the polling loop from the agent so it can treat the tool
-as a synchronous query.
+  - Recent events (last few minutes / hours) need to be read NOW.
+  - Insights queries are returning 0 results despite the console
+    showing events (the classic indexing-lag symptom).
+  - The user wants raw event JSON without aggregation.
+
+For stats / aggregations / wide historical time windows, prefer the
+MCP's ``execute_log_insights_query`` (cheaper for large scans).
 """
 
 from __future__ import annotations
 
-import time
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import boto3
@@ -23,133 +31,76 @@ from strands import tool
 
 from app.config import REGION
 
-# Module-level client, reused across invocations (see app/tools/metrics.py
-# for the rationale).
+# Module-level client, reused across invocations; thread-safe for the
+# read APIs used here. See concurrency note in app/main.py.
 _logs = boto3.client("logs", region_name=REGION)
 
-# Polling configuration for Logs Insights. Insights queries usually
-# complete in well under a second for small log groups, but heavy queries
-# over wide time ranges can take 30+ seconds. We cap the wait at 60s to
-# avoid blocking the AgentCore Runtime invocation indefinitely.
-_POLL_INTERVAL_SECONDS = 1.0
-_POLL_TIMEOUT_SECONDS = 60.0
-
 
 @tool
-def list_log_groups(name_prefix: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-    """List CloudWatch log groups, optionally filtered by name prefix.
-
-    Args:
-        name_prefix: Optional log-group name prefix filter (e.g.
-            ``/aws/lambda/``). When omitted, all log groups are returned
-            up to ``limit``.
-        limit: Maximum number of log groups to return. Defaults to 50,
-            which keeps token usage bounded; the LLM can request a
-            wider page by raising this value.
-
-    Returns:
-        List of dicts with ``log_group_name``, ``creation_time`` (ISO-8601),
-        ``stored_bytes``, and ``retention_in_days`` (or ``None`` for
-        log groups with no retention policy set).
-    """
-    kwargs: dict[str, Any] = {"limit": min(limit, 50)}
-    if name_prefix:
-        kwargs["logGroupNamePrefix"] = name_prefix
-
-    response = _logs.describe_log_groups(**kwargs)
-
-    results: list[dict[str, Any]] = []
-    for log_group in response.get("logGroups", []):
-        # creationTime is returned as epoch milliseconds by the API.
-        creation_ms = log_group.get("creationTime", 0)
-        results.append(
-            {
-                "log_group_name": log_group["logGroupName"],
-                "creation_time": datetime.fromtimestamp(
-                    creation_ms / 1000, tz=UTC
-                ).isoformat(),
-                "stored_bytes": log_group.get("storedBytes", 0),
-                # retentionInDays is omitted for "Never expire" log groups.
-                "retention_in_days": log_group.get("retentionInDays"),
-            }
-        )
-    return results
-
-
-@tool
-def run_logs_insights_query(
-    log_group_names: list[str],
-    query: str,
-    lookback_minutes: int = 60,
+def filter_log_events(
+    log_group_name: str,
+    filter_pattern: str | None = None,
+    lookback_minutes: int = 20160,
+    log_stream_names: list[str] | None = None,
     limit: int = 100,
-) -> list[dict[str, str]]:
-    """Run a CloudWatch Logs Insights query and return the results.
+) -> list[dict[str, Any]]:
+    """Read raw log events from a CloudWatch log group via FilterLogEvents.
 
-    Hides the asynchronous query lifecycle from the caller: starts the
-    query, polls until it reaches a terminal status, and returns the
-    flattened result rows.
+    Bypasses Logs Insights — events appear here as soon as they are
+    ingested (no indexing lag), so this is the right tool when the user
+    expects to see recent activity and Insights is returning 0 results.
 
     Args:
-        log_group_names: List of log group names to query against.
-            Insights supports up to 50 log groups in a single query.
-        query: The Logs Insights query string. See
-            https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html.
-        lookback_minutes: Time window for the query, ending at "now".
-            Defaults to 60 minutes.
-        limit: Maximum number of result rows to return at the API level.
-            Insights itself caps results at 10,000 per query.
+        log_group_name: Log group to read, e.g. ``"/cloudwatch-agent/demo"``.
+        filter_pattern: Optional CloudWatch Logs filter pattern. For
+            structured JSON logs use the JSON form, e.g.:
+
+              ``{ $.level = "ERROR" }``
+              ``{ $.service = "payments" && $.status_code = 500 }``
+              ``{ $.error_code = "OrderDBConnectionPoolExhausted" }``
+
+            Or a plain quoted word match (case-sensitive substring), e.g.
+            ``"timeout"``. Omit to fetch every event in the window. See
+            https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html.
+        lookback_minutes: How far back to look, ending at "now". Default
+            is ``20160`` (14 days) because the cost of a wide window is
+            bounded by ``limit`` (which caps the response payload), and a
+            narrow default would silently miss backdated demo data and
+            older events. Set a smaller value (e.g. 60) explicitly if
+            you only care about the last hour.
+        log_stream_names: Optional subset of stream names to read from
+            (e.g. ``["gateway", "orders"]``). Omit to scan every stream
+            in the group.
+        limit: Maximum events to return (FilterLogEvents caps a single
+            page at 10000; we only fetch one page to bound token usage).
 
     Returns:
-        List of result rows. Each row is a flat ``{field_name: value}``
-        dict, projecting away the ``[{"field": ..., "value": ...}, ...]``
-        envelope that the raw API returns.
-
-    Raises:
-        TimeoutError: If the query does not complete within
-            ``_POLL_TIMEOUT_SECONDS``.
-        RuntimeError: If the query reaches a ``Failed`` or ``Cancelled``
-            terminal status.
+        List of ``{timestamp, log_stream_name, message}`` dicts. The
+        ``timestamp`` is ISO-8601 UTC; ``message`` is the raw event body
+        (already JSON for structured logs — the LLM can parse if needed).
     """
-    end_time = datetime.now(UTC)
-    start_time = end_time - timedelta(minutes=lookback_minutes)
+    end_ms = int(datetime.now(UTC).timestamp() * 1000)
+    start_ms = end_ms - lookback_minutes * 60 * 1000
 
-    # StartQuery accepts epoch seconds (not millis like most other Logs APIs).
-    start_response = _logs.start_query(
-        logGroupNames=log_group_names,
-        startTime=int(start_time.timestamp()),
-        endTime=int(end_time.timestamp()),
-        queryString=query,
-        limit=limit,
-    )
-    query_id = start_response["queryId"]
+    kwargs: dict[str, Any] = {
+        "logGroupName": log_group_name,
+        "startTime": start_ms,
+        "endTime": end_ms,
+        "limit": limit,
+    }
+    if filter_pattern:
+        kwargs["filterPattern"] = filter_pattern
+    if log_stream_names:
+        kwargs["logStreamNames"] = log_stream_names
 
-    # Poll for completion. Insights statuses are: Scheduled, Running,
-    # Complete, Failed, Cancelled, Timeout. The last four are terminal.
-    deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
-    while True:
-        if time.monotonic() > deadline:
-            # Stop the query so we don't leave it running on the server.
-            try:
-                _logs.stop_query(queryId=query_id)
-            except Exception:
-                # Best-effort cleanup; surface the original timeout.
-                pass
-            raise TimeoutError(
-                f"Logs Insights query {query_id} did not complete within "
-                f"{_POLL_TIMEOUT_SECONDS}s."
-            )
-
-        result = _logs.get_query_results(queryId=query_id)
-        status = result["status"]
-
-        if status == "Complete":
-            break
-        if status in ("Failed", "Cancelled", "Timeout"):
-            raise RuntimeError(
-                f"Logs Insights query {query_id} ended with status {status!r}."
-            )
-
-        time.sleep(_POLL_INTERVAL_SECONDS)
-
-    # Flatten the [{"field": ..., "value": ...}] envelope into a plain dict.
-    return [{field["field"]: field["value"] for field in row} for row in result.get("results", [])]
+    response = _logs.filter_log_events(**kwargs)
+    return [
+        {
+            "timestamp": datetime.fromtimestamp(
+                event["timestamp"] / 1000, tz=UTC
+            ).isoformat(),
+            "log_stream_name": event.get("logStreamName"),
+            "message": event["message"],
+        }
+        for event in response.get("events", [])
+    ]

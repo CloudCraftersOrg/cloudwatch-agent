@@ -192,14 +192,44 @@ data "aws_identitystore_users" "all" {
   identity_store_id = local._sso_identity_store_id
 }
 
-# Grant every Identity Center user the configured role. user_ids is a
-# flat list; AMG handles association creation/removal in-place when the
-# set changes between applies.
+locals {
+  # Per-user admin IDs (resolved by admin_users data source below). May
+  # be empty if grafana_admin_user_names is empty or Identity Center is
+  # absent — the resource that uses it guards with the same condition.
+  _admin_user_ids = (
+    local._sso_identity_store_id != null
+    ? [for u in data.aws_identitystore_user.admin_users : u.user_id]
+    : []
+  )
+
+  # All-users IDs minus the per-user admins. AMG promotes the higher
+  # role when a user has multiple associations, so admins assigned via
+  # grafana_admin_user_names would be silently demoted FROM the
+  # all_users VIEWER list — which then leaves the VIEWER association
+  # with 0 users and triggers the provider's "empty result" read bug.
+  # Subtracting the admins keeps the two lists disjoint and avoids that.
+  _auto_grant_user_ids = (
+    local._sso_identity_store_id != null
+    ? tolist(setsubtract(
+      toset([for u in data.aws_identitystore_users.all[0].users : u.user_id]),
+      toset(local._admin_user_ids),
+    ))
+    : []
+  )
+}
+
+# Grant every NON-ADMIN Identity Center user the configured role. The
+# resource is only created when there's at least one user to associate;
+# an empty user_ids list yields the provider's "empty result" read bug.
 resource "aws_grafana_role_association" "all_users" {
-  count = local._sso_identity_store_id != null ? 1 : 0
+  count = (
+    var.grafana_grant_all_users_role != "" &&
+    length(local._auto_grant_user_ids) > 0
+    ? 1 : 0
+  )
 
   role         = var.grafana_grant_all_users_role
-  user_ids     = [for u in data.aws_identitystore_users.all[0].users : u.user_id]
+  user_ids     = local._auto_grant_user_ids
   workspace_id = aws_grafana_workspace.this.id
 }
 

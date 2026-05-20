@@ -1,17 +1,38 @@
 # ###########################################################################
 # CloudWatch Agent container image.
 #
-# Single-stage build. We deliberately keep this simple: AgentCore Runtime
-# pulls images from ECR on every cold start, so a tighter image only
-# matters insofar as it speeds up cold starts — and the heavy dependency
-# here (boto3 + Strands + AgentCore SDK) dominates total size regardless
-# of any multi-stage trickery.
+# Two-stage build:
+#   1. mcp-grafana-builder: ``go install`` builds the Grafana MCP server
+#      (https://github.com/grafana/mcp-grafana) for linux/arm64. We
+#      bundle it in the image so the agent process can spawn it locally
+#      via stdio without depending on Docker-in-Docker or sidecars.
+#   2. Final runtime image: Python 3.13 slim + uv-installed deps + the
+#      app code + the mcp-grafana binary copied from stage 1.
 #
 # IMPORTANT: AgentCore Runtime ONLY accepts linux/arm64 images. Building
 # on an x86_64 host requires `docker buildx build --platform linux/arm64`.
 # Pushing an amd64 image will succeed at the ECR layer but fail at
 # Runtime deployment with an opaque platform-mismatch error.
 # ###########################################################################
+
+# --- Stage 1: build the Grafana MCP server binary -------------------------
+# golang:1.24-bookworm is required: mcp-grafana v0.7.0 declares
+# ``go >= 1.24.6`` in its go.mod, so a 1.23.x toolchain fails build
+# with "requires go >= 1.24.6 (running go 1.23.x)". Bump in lockstep
+# with MCP_GRAFANA_VERSION if a future release raises the minimum.
+FROM --platform=linux/arm64 golang:1.24-bookworm AS mcp-grafana-builder
+
+# Pin a recent mcp-grafana release. Bump deliberately; ``@latest`` would
+# pull whatever HEAD is at build time and undermine reproducibility.
+ARG MCP_GRAFANA_VERSION=v0.7.0
+
+# ``go install`` fetches the module + dependencies and produces a static
+# binary at /go/bin/mcp-grafana. CGO disabled for a fully static binary
+# that can run on python:3.13-slim without extra shared libs.
+ENV CGO_ENABLED=0
+RUN go install "github.com/grafana/mcp-grafana/cmd/mcp-grafana@${MCP_GRAFANA_VERSION}"
+
+# --- Stage 2: runtime image ------------------------------------------------
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.13-slim
 
 # Standard Python flags for containerized workloads:
@@ -47,6 +68,12 @@ COPY pyproject.toml uv.lock* ./
 # Install runtime dependencies into the system site-packages. We pass
 # --no-dev to skip ruff and any other dev-only packages.
 RUN uv sync --frozen --no-dev || uv sync --no-dev
+
+# Bring in the mcp-grafana binary built in stage 1. The agent spawns it
+# via stdio at boot (see app/mcp_clients.py); placing it in
+# /usr/local/bin keeps it on the default PATH so the subprocess can be
+# launched by short name.
+COPY --from=mcp-grafana-builder /go/bin/mcp-grafana /usr/local/bin/mcp-grafana
 
 # Copy the application code last so source edits don't bust the
 # dependency layer above.

@@ -17,7 +17,12 @@
       "Bash(terraform -chdir=terraform console)",
       "Bash(echo \"fmt: $?\")",
       "Bash(terraform -chdir=/Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/terraform validate -no-color)",
-      "Bash(aws identitystore *)"
+      "Bash(aws identitystore *)",
+      "Bash(.venv/bin/python -c \"import mcp; print\\('mcp', getattr\\(mcp, '__version__', '?'\\)\\)\")",
+      "Bash(uv sync *)",
+      "Bash(.venv/bin/which awslabs.cloudwatch-mcp-server)",
+      "Bash(python3 -m py_compile app/tools/logs.py app/prompts.py)",
+      "WebFetch(domain:grafana.com)"
     ]
   }
 }

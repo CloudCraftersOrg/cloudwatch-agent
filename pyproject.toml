@@ -15,15 +15,26 @@ license = { file = "LICENSE" }
 
 # Runtime dependencies. Kept intentionally small:
 #   - bedrock-agentcore: AgentCore Runtime SDK (BedrockAgentCoreApp + Memory integrations).
-#   - strands-agents:    Strands Agent framework (LLM reasoning loop + @tool decorator).
-#   - boto3:             AWS SDK used by the tool implementations to call CloudWatch, EC2, RDS, Lambda.
+#   - strands-agents:    Strands Agent framework (LLM reasoning loop + @tool decorator,
+#                        plus MCPClient for stdio MCP server integration).
+#   - boto3:             AWS SDK used by the custom tools (FilterLogEvents path, EC2/RDS/Lambda,
+#                        Grafana token mint, etc.).
 #   - aws-opentelemetry-distro: OTEL distro that ships the AWS exporters AgentCore expects
 #                               for built-in observability (traces/metrics/logs to CloudWatch).
+#   - mcp:               Model Context Protocol Python client (stdio transport for the
+#                        CloudWatch MCP server below). Strands depends on it transitively
+#                        but we pin it explicitly so it can't be silently dropped.
+#   - awslabs.cloudwatch-mcp-server: AWS Labs CloudWatch MCP server. Spawned as a stdio
+#                                    subprocess at agent boot and its tools (describe_log_groups,
+#                                    execute_log_insights_query, analyze_log_group, get_metric_data,
+#                                    alarm helpers) are exposed to the LLM.
 dependencies = [
     "bedrock-agentcore",
     "strands-agents",
     "boto3",
     "aws-opentelemetry-distro>=0.10.1",
+    "mcp",
+    "awslabs.cloudwatch-mcp-server",
 ]
 
 [dependency-groups]
