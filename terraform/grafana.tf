@@ -202,3 +202,38 @@ resource "aws_grafana_role_association" "all_users" {
   user_ids     = [for u in data.aws_identitystore_users.all[0].users : u.user_id]
   workspace_id = aws_grafana_workspace.this.id
 }
+
+# Resolve each requested admin user_name to its Identity Center user_id.
+# for_each keyed by user_name so removals from the list cleanly destroy
+# the matching lookup. Skipped entirely when no Identity Center instance
+# was found (the local is null) so we don't leave dangling errors.
+data "aws_identitystore_user" "admin_users" {
+  for_each = (
+    local._sso_identity_store_id != null
+    ? toset(var.grafana_admin_user_names)
+    : toset([])
+  )
+  provider          = aws.identity_center
+  identity_store_id = local._sso_identity_store_id
+
+  alternate_identifier {
+    unique_attribute {
+      attribute_path  = "UserName"
+      attribute_value = each.value
+    }
+  }
+}
+
+# ADMIN role grant for the per-user admins. Separate from all_users
+# above because AMG resolves the highest role across associations, so
+# the same user can appear in both lists and end up ADMIN.
+resource "aws_grafana_role_association" "admin_users" {
+  count = (
+    length(var.grafana_admin_user_names) > 0 && local._sso_identity_store_id != null
+    ? 1 : 0
+  )
+
+  role         = "ADMIN"
+  user_ids     = [for u in data.aws_identitystore_user.admin_users : u.user_id]
+  workspace_id = aws_grafana_workspace.this.id
+}

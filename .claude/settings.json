@@ -16,7 +16,8 @@
       "Bash(echo \"fmt check exit: $?\")",
       "Bash(terraform -chdir=terraform console)",
       "Bash(echo \"fmt: $?\")",
-      "Bash(terraform -chdir=/Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/terraform validate -no-color)"
+      "Bash(terraform -chdir=/Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/terraform validate -no-color)",
+      "Bash(aws identitystore *)"
     ]
   }
 }

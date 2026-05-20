@@ -46,6 +46,17 @@ variable "grafana_admin_group_ids" {
   default     = []
 }
 
+# Specific Identity Center USERS (by user_name) to grant Grafana ADMIN.
+# Resolved against the same Identity Center as the all-users auto-grant
+# (var.identity_center_region). Useful for the deploy operator(s): keeps
+# their ADMIN role in IaC so it survives a destroy/recreate, instead of
+# relying on a manual console assignment.
+variable "grafana_admin_user_names" {
+  description = "IAM Identity Center user names (e.g. [\"santiacmaestre\"]) to grant Grafana ADMIN. Empty = no per-user admins."
+  type        = list(string)
+  default     = []
+}
+
 # Grant the same Grafana role to EVERY IAM Identity Center user in the
 # account's identity store. Without an association, an SSO login lands on
 # "Login failed [sso.auth.access-denied]"; AMG does not grant access
