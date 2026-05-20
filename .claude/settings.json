@@ -26,7 +26,16 @@
       "Bash(python3 -m py_compile app/main.py)",
       "Bash(python3 -m py_compile seeds/*.py app/*.py app/tools/*.py)",
       "Bash(python3 -m py_compile seeds/_common.py seeds/week1.py seeds/week2.py)",
-      "Bash(python3 -m py_compile app/mcp_clients.py)"
+      "Bash(python3 -m py_compile app/mcp_clients.py)",
+      "Bash(python3 -m py_compile app/*.py app/tools/*.py)",
+      "Bash(terraform -chdir=terraform init -upgrade -no-color)",
+      "Bash(terraform -chdir=terraform init -backend=false -upgrade -no-color)",
+      "Bash(terraform -chdir=terraform init -backend=false -no-color)",
+      "Bash(terraform -chdir=terraform providers schema -json)",
+      "Bash(python3 -m py_compile invoke.py)",
+      "Bash(.venv/bin/python invoke.py --help)",
+      "Bash(.venv/bin/python -c \"import rich; print\\('rich', rich.__version__\\)\")",
+      "Bash(.venv/bin/python -c \"from rich.console import Console; from rich.panel import Panel; from rich.rule import Rule; from rich.text import Text; print\\('imports OK'\\)\")"
     ]
   }
 }

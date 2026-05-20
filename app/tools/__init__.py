@@ -41,6 +41,7 @@ from __future__ import annotations
 
 from app.mcp_clients import CLOUDWATCH_MCP_TOOLS, GRAFANA_MCP_TOOLS
 from app.tools.dashboards import get_cloudwatch_datasource
+from app.tools.judge import judge_dashboard_quality
 from app.tools.logs import filter_log_events
 from app.tools.resources import discover_resources
 
@@ -52,6 +53,9 @@ TOOLS = [
     # Custom: CloudWatch data source UID lookup (cheaper than calling
     # grafana_list_datasources every dashboard build).
     get_cloudwatch_datasource,
+    # Custom: LLM-as-judge for the dashboard JSON. The system prompt
+    # requires this to be called before grafana_update_dashboard.
+    judge_dashboard_quality,
     # AWS Labs CloudWatch MCP server (Insights, metrics, alarms, ...).
     *CLOUDWATCH_MCP_TOOLS,
     # Grafana Labs Grafana MCP server (dashboards, datasources, ...).

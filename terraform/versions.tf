@@ -15,6 +15,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.18"
     }
+    # awscc covers Bedrock AgentCore resources that don't exist in
+    # hashicorp/aws yet (notably AWS::BedrockAgentCore::Evaluator —
+    # the LLM-as-a-Judge / code-based post-hoc trace evaluator used
+    # for agent quality observability; see evaluator.tf).
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = "~> 1.0"
+    }
     grafana = {
       source  = "grafana/grafana"
       version = "~> 3.0"

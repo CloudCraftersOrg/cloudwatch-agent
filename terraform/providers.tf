@@ -40,6 +40,10 @@ provider "aws" {
   }
 }
 
+provider "awscc" {
+  region = var.region
+}
+
 provider "grafana" {
   # Amazon Managed Grafana exposes a standard Grafana HTTP API at the
   # workspace endpoint. The provider talks to that API as the Terraform

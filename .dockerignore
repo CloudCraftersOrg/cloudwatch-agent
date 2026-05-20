@@ -16,6 +16,10 @@ __pycache__/
 # Demo seed scripts are operator-run; the image only needs app/.
 seeds/
 
+# Local invocation client (operator-run, never executes inside the
+# container).
+invoke.py
+
 # Editor metadata
 .vscode/
 .idea/

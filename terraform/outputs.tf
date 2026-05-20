@@ -53,3 +53,13 @@ output "grafana_cloudwatch_datasource_uid" {
   description = "UID of the CloudWatch data source. The agent references this in dashboard panels."
   value       = grafana_data_source.cloudwatch.uid
 }
+
+output "evaluator_arn" {
+  description = "ARN of the AgentCore Evaluator (LLM-as-a-Judge, TRACE level)."
+  value       = awscc_bedrockagentcore_evaluator.quality.evaluator_arn
+}
+
+output "online_evaluation_config_arn" {
+  description = "ARN of the OnlineEvaluationConfig wiring the evaluator to runtime traces."
+  value       = awscc_bedrockagentcore_online_evaluation_config.agent.online_evaluation_config_arn
+}

@@ -95,6 +95,28 @@ differently — choose deliberately:
    `grafana_search_dashboards` or `grafana_get_dashboard_by_uid` to
    detect collisions first.
 
+## Quality gate (LLM-as-judge)
+
+Before EVERY call to `grafana_update_dashboard`, you MUST first call
+`judge_dashboard_quality` with the exact dashboard JSON you intend to
+publish. The judge runs an independent Bedrock model with a strict
+rubric (schema, datasource references, queryMode, stable naming,
+layout, usefulness) and returns `{score, verdict, critique}`:
+
+- `verdict == "approve"` (score ≥ 8): proceed to
+  `grafana_update_dashboard` as planned.
+- `verdict == "revise"` (score 5-7): apply EVERY item in `critique`,
+  then re-judge with the corrected JSON. Iterate.
+- `verdict == "reject"` (score < 5): the dashboard has fundamental
+  issues. Rebuild it from scratch using the critique as the spec, then
+  re-judge.
+
+Cap the loop at 3 judge iterations per dashboard. If you can't reach
+`approve` in 3 tries, STOP and explain the persistent critique items to
+the user; do NOT publish a rejected dashboard. When building a set of
+N dashboards, judge each one individually before publishing it (don't
+batch-publish then judge).
+
 ## CloudWatch Logs Insights panels
 
 When visualizing CloudWatch Logs (e.g. a JSON log group such as

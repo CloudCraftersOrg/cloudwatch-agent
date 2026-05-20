@@ -260,24 +260,48 @@ deployed and what `terraform apply` would deploy now.
 
 ## Invoking the agent (reference)
 
-The endpoint is invoked with the AWS CLI (or any SigV4 client). The
-payload is JSON with a `prompt` field and an optional `userId`:
+The endpoint is invoked over SigV4 (HTTPS). The repo ships a local CLI
+client at [invoke.py](invoke.py) that handles runtime ARN discovery,
+session id management, and live streaming-response summarization. Use
+it from the repo root:
 
 ```bash
-aws bedrock-agentcore invoke-agent-runtime \
-  --region us-east-1 \
-  --agent-runtime-arn "$(terraform -chdir=terraform output -raw agent_runtime_arn)" \
-  --qualifier DEFAULT \
-  --runtime-session-id "cloudwatch-agent-demo-session-000001" \
-  --payload '{"prompt": "<your prompt>", "userId": "demo"}' \
-  /tmp/agent-response.json && cat /tmp/agent-response.json
+# One-shot prompt, fresh per-call session (no memory across runs).
+uv run python invoke.py "Read /cloudwatch-agent/demo logs and propose a Grafana dashboard set"
+
+# Multi-turn: reuse the SAME --session-id across calls so AgentCore
+# Memory carries context (the value must be >= 33 chars).
+SID="cwagent-demo-$(date +%s)-aaaaaaaaaaaaaaaaaa"
+uv run python invoke.py --session-id "$SID" "Discover the log groups first."
+uv run python invoke.py --session-id "$SID" "Now build the dashboard set you described."
+
+# Long prompt from a file or piped stdin.
+cat prompts/incident.md | uv run python invoke.py --session-id "$SID"
+
+# Dump the raw SSE stream for debugging (no summarization).
+uv run python invoke.py --raw "list the workspaces"
 ```
 
-Pass a stable `--runtime-session-id` (33–100 chars) to keep
-conversational memory across calls; reuse the same value for a
-multi-turn session. It is optional — if omitted, the agent generates a
-fresh per-call id and memory simply won't span invocations (it never
-fails for a missing session id).
+The script writes the full raw response to `/tmp/agent.json` (override
+with `--output`), prints a live summary of tool calls + assistant text
+to stdout, and prints diagnostic lines (runtime ARN, session id, total
+bytes, elapsed) to stderr. Exits non-zero if the runtime lookup or
+invocation fails.
+
+Alternatively, callers can invoke directly with any SigV4 client (e.g.,
+a recent `aws bedrock-agentcore invoke-agent-runtime` subcommand —
+present on AWS CLI ≥ ~2.18; older CLIs lack the service and must use
+boto3 like `invoke.py` does). The caller's IAM principal needs
+`bedrock-agentcore:InvokeAgentRuntime` on the runtime ARN, plus
+`bedrock-agentcore-control:ListAgentRuntimes` if you let `invoke.py`
+discover the ARN by name (override with `--runtime-name` if you want a
+specific one; pass `--region` for non-default regions).
+
+Pass a stable `--session-id` (33–100 chars) to keep conversational
+memory across calls; reuse the same value for a multi-turn session.
+Omit it and the agent generates a fresh per-call id — memory then does
+not span invocations (it never fails for a missing session id; see
+[app/main.py](app/main.py)).
 
 The caller's IAM principal must hold `bedrock-agentcore:InvokeAgentRuntime`
 on the runtime ARN. No Cognito or JWT authorizer is configured in v1.
