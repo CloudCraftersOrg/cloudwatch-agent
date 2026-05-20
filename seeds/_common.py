@@ -2,19 +2,34 @@
 
 Both week scripts write structured JSON log events into ONE CloudWatch
 Logs log group, using one log stream per simulated service. The agent
-reads them later with CloudWatch Logs Insights (which auto-discovers the
-JSON fields ``level``, ``service``, ``status_code``, ``latency_ms`` ...).
+reads them later with ``filter_log_events`` (and ``cw_mcp_*`` Insights
+tools for stats / aggregations).
+
+Design decision — no backdating:
+
+CloudWatch Logs Insights only indexes events whose timestamp is >= the
+log group's ``creationTime``. The earlier "two real weeks" approach
+(events with timestamps 6-13 days in the past) silently broke Insights
+whenever the log group was recreated (a fresh creationTime made every
+backdated event "pre-creation" and thus invisible to Insights, even
+though FilterLogEvents and the Console "Log events" tab still saw them).
+
+To keep both data planes (FilterLogEvents AND Insights) happy and to
+keep the seed dead-simple, we now inject **all events within the last
+``WINDOW_MINUTES`` minutes** — i.e. always strictly after the log
+group's creationTime, regardless of when the log group was created.
+The narrative "two real weeks" is replaced by "two phases of recent
+activity": week1 lays down a baseline, week2 (run later) appends an
+evolution + an incident burst near "now".
 
 CloudWatch Logs constraints handled here so the week scripts don't have
 to think about them:
 
 * A ``PutLogEvents`` batch must be sorted by timestamp, span <= 24h, and
-  stay under 10k events / ~1 MB. We push one batch per (service, day),
-  which satisfies all three by construction.
-* Events older than 14 days (or the log group's retention) are rejected
-  by the API. We drop anything beyond a safe age and warn, rather than
-  letting the whole batch fail — this is what keeps the "two real weeks"
-  timeline robust if the demo runs slowly.
+  stay under 10k events / ~1 MB. Our window is way under 24h, and we
+  chunk under the count/size caps below.
+* Events older than 14 days are rejected by the API. Our window is
+  60 min, so this never trips.
 """
 
 from __future__ import annotations
@@ -36,23 +51,15 @@ DEFAULT_LOG_GROUP = "/cloudwatch-agent/demo"
 DEFAULT_REGION = "us-east-1"
 RETENTION_DAYS = 30
 
+# All events are spread uniformly over the last ``WINDOW_MINUTES``
+# minutes. Wide enough to show a sortable time series in dashboards;
+# small enough to bound the data and keep PutLogEvents batches cheap.
+WINDOW_MINUTES = 60
+
 # PutLogEvents limits, with safety margins below the hard caps.
 _MAX_BATCH_EVENTS = 1000
 _MAX_BATCH_BYTES = 900_000
 _EVENT_OVERHEAD = 26  # Bytes CloudWatch adds per event for size accounting.
-
-# Refuse events older than this. The hard API limit is 14 days; we keep a
-# 3-hour margin so clock skew / a slow demo run can't trip a hard reject.
-_MAX_AGE = timedelta(days=14) - timedelta(hours=3)
-
-# Per-hour weighting (UTC) to give the data a believable diurnal shape so
-# dashboards look like real traffic instead of white noise. Low overnight,
-# peak around midday/afternoon in the Americas.
-_HOUR_WEIGHTS = [
-    0.3, 0.2, 0.2, 0.2, 0.3, 0.4, 0.6, 0.9,  # 00-07
-    1.3, 1.7, 2.0, 2.2, 2.3, 2.3, 2.2, 2.0,  # 08-15
-    1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.4,  # 16-23
-]
 
 
 @dataclass
@@ -60,8 +67,11 @@ class ServiceProfile:
     """How one service behaves for a given week.
 
     Attributes:
-        per_day: Approximate event count per level per day. Actual counts
-            jitter +/-30% so days are not identical.
+        per_day: Approximate event count per level per "day" — kept as
+            the field name for backward-compat with existing week*.py
+            specs, but now interpreted as ``events_per_window_per_level``
+            scaled by ``SeedSpec.num_days`` (so the total volume per
+            service stays roughly comparable to the old day-based seed).
         templates: Candidate message strings per level.
         status: Candidate HTTP status codes per level.
         latency_ms: ``(low, high)`` latency range per level (ms).
@@ -80,12 +90,19 @@ class Incident:
     The window is intentionally narrow and the ``error_code`` distinctive
     so a prompt like "build an incident dashboard for the orders outage"
     has something unambiguous to visualize.
+
+    With the new seed timing model (everything within the last
+    ``WINDOW_MINUTES``), the incident is a tight burst landing somewhere
+    inside the same window. The legacy ``day_offset``/``start_hour``/
+    ``duration_hours`` fields are kept on the dataclass for backward
+    compatibility with week2.py's existing SPEC but are no longer used —
+    the burst now lasts a fixed ``_INCIDENT_BURST_MINUTES``.
     """
 
     service: str
-    day_offset: int  # Days ago the incident occurred (must fall in the run).
-    start_hour: int  # UTC hour the burst starts.
-    duration_hours: int
+    day_offset: int  # legacy, ignored
+    start_hour: int  # legacy, ignored
+    duration_hours: int  # legacy, ignored
     count: int
     error_code: str
     message: str
@@ -96,13 +113,17 @@ class SeedSpec:
     """Everything a week script needs to declare; the rest is generic."""
 
     name: str
-    start_days_ago: int
-    num_days: int
+    start_days_ago: int  # legacy, ignored — kept for week*.py back-compat
+    num_days: int  # interpreted as a volume scalar (see ServiceProfile)
     profiles: dict[str, ServiceProfile]
     incident: Incident | None = None
     # Free-text lines printed after the run to tell the operator exactly
     # what changed and which prompts to try next.
     notes: list[str] = field(default_factory=list)
+
+
+# How wide (in minutes) the incident burst spans, ending just before "now".
+_INCIDENT_BURST_MINUTES = 10
 
 
 def parse_args(description: str) -> argparse.Namespace:
@@ -137,8 +158,6 @@ def _ensure_stream(client, log_group: str, stream: str) -> None:
         client.create_log_group(logGroupName=log_group)
     except client.exceptions.ResourceAlreadyExistsException:
         pass
-    # Retention must comfortably exceed the 13-day data span; 30 days also
-    # means the API won't reject our oldest (~13d) backdated events.
     client.put_retention_policy(
         logGroupName=log_group, retentionInDays=RETENTION_DAYS
     )
@@ -173,33 +192,23 @@ def _put_batch(client, log_group: str, stream: str, batch: list[dict]) -> None:
 
 
 def _flush(client, log_group: str, stream: str, events: list[tuple[int, str]]) -> int:
-    """Sort, age-guard, chunk and push events for one (service, day).
+    """Sort and chunk events; push under the PutLogEvents limits.
 
     Args:
         events: ``(epoch_ms, message)`` pairs, any order.
 
     Returns:
-        Number of events actually sent (after dropping too-old ones).
+        Number of events actually sent.
     """
     if not events:
         return 0
 
-    min_ts_ms = int((datetime.now(UTC) - _MAX_AGE).timestamp() * 1000)
-    fresh = sorted((e for e in events if e[0] >= min_ts_ms), key=lambda e: e[0])
-    dropped = len(events) - len(fresh)
-    if dropped:
-        print(
-            f"  ! {dropped} event(s) older than the 14-day CloudWatch Logs "
-            f"limit were skipped on stream '{stream}'."
-        )
-
+    fresh = sorted(events, key=lambda e: e[0])
     sent = 0
     batch: list[dict] = []
     batch_bytes = 0
     for ts_ms, message in fresh:
         size = len(message.encode("utf-8")) + _EVENT_OVERHEAD
-        # Flush when adding this event would exceed either cap. (The 24h
-        # span cap is satisfied automatically: callers flush per day.)
         if batch and (
             len(batch) >= _MAX_BATCH_EVENTS or batch_bytes + size > _MAX_BATCH_BYTES
         ):
@@ -227,9 +236,9 @@ def _event_message(
 ) -> str:
     """Build one structured JSON log line.
 
-    The shape is intentionally flat and CloudWatch-Logs-Insights-friendly:
+    The shape is intentionally flat and Logs-Insights-friendly:
     Insights auto-extracts top-level JSON keys, so the agent can write
-    ``stats count() by bin(1h), service`` style queries with no parsing.
+    ``stats count() by bin(1m), service`` style queries with no parsing.
     """
     lo, hi = profile.latency_ms[level]
     payload = {
@@ -246,25 +255,13 @@ def _event_message(
     return json.dumps(payload, separators=(",", ":"))
 
 
-def _spread_timestamps(
-    rng: random.Random, day_start: datetime, upper: datetime, count: int
-) -> list[datetime]:
-    """Pick ``count`` timestamps within a day, diurnally weighted."""
-    out: list[datetime] = []
-    hours = list(range(24))
-    for _ in range(count):
-        hour = rng.choices(hours, weights=_HOUR_WEIGHTS, k=1)[0]
-        when = day_start + timedelta(
-            hours=hour, minutes=rng.randint(0, 59), seconds=rng.randint(0, 59)
-        )
-        # Never emit into the future / past the run moment.
-        if when < upper:
-            out.append(when)
-    return out
-
-
 def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
-    """Generate and push a full week of data, then print a summary.
+    """Generate and push the seed events, then print a summary.
+
+    All events are spread uniformly over the last ``WINDOW_MINUTES``
+    minutes ending at "now". Volume per (service, level) is
+    ``profile.per_day[level] * spec.num_days`` with +/-30% jitter (same
+    as before, just collapsed into a single window).
 
     Args:
         spec: The declarative week definition (see SeedSpec).
@@ -275,76 +272,55 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
     client = (build_client or (lambda: boto3.client("logs", region_name=args.region)))()
 
     now = datetime.now(UTC).replace(microsecond=0)
-    # Day boundaries are floored to the hour so windows are stable.
-    base = now.replace(minute=0, second=0)
+    now_ms = int(now.timestamp() * 1000)
+    window_seconds = WINDOW_MINUTES * 60
 
     print(f"== seed '{spec.name}' ==")
     print(f"log group : {args.log_group}  (region {args.region})")
+    print(f"window    : last {WINDOW_MINUTES} minutes (ending {now.isoformat()})")
     print(
-        f"window    : ~{spec.start_days_ago} .. "
-        f"{spec.start_days_ago - spec.num_days} days ago "
-        f"({spec.num_days} days)"
-    )
-    # Re-runs are NOT idempotent: timestamps are recomputed from the
-    # current wall clock each run, so CloudWatch accepts them as new
-    # events and the data is DUPLICATED (the DataAlreadyAccepted guard
-    # only covers a byte-identical batch, which never recurs). week2 is
-    # designed to append to week1; but re-running the SAME week doubles
-    # its counts. To start clean, delete the log group first:
-    #   aws logs delete-log-group --log-group-name <group> --region <r>
-    print(
-        f"! re-running this seed APPENDS (duplicates) data. To reset, first: "
-        f"aws logs delete-log-group --log-group-name {args.log_group} "
-        f"--region {args.region}"
+        f"! re-runs APPEND (duplicate) data. To reset cleanly, delete "
+        f"individual STREAMS (not the log group itself): "
+        f"aws logs delete-log-stream --log-group-name {args.log_group} "
+        f"--log-stream-name <stream> --region {args.region}"
     )
 
     # tally[service][level] = count, for the closing summary.
     tally: dict[str, dict[str, int]] = {}
 
     for service, profile in spec.profiles.items():
-        stream = service
-        _ensure_stream(client, args.log_group, stream)
+        _ensure_stream(client, args.log_group, service)
         tally.setdefault(service, {})
 
-        for i in range(spec.num_days):
-            day_start = base - timedelta(days=spec.start_days_ago) + timedelta(days=i)
-            day_upper = min(day_start + timedelta(days=1), now - timedelta(minutes=1))
-            if day_upper <= day_start:
-                continue
+        events: list[tuple[int, str]] = []
+        for level, mean in profile.per_day.items():
+            # Total event count = (per_day count) * num_days, with the
+            # same +/-30% jitter the old seed used. num_days is now just
+            # a volume scalar (no longer "days").
+            count = max(0, int(mean * spec.num_days * rng.uniform(0.7, 1.3)))
+            for _ in range(count):
+                offset_sec = rng.uniform(0, window_seconds)
+                ts_ms = now_ms - int(offset_sec * 1000)
+                when = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
+                msg = _event_message(rng, when, service, level, profile)
+                events.append((ts_ms, msg))
+                tally[service][level] = tally[service].get(level, 0) + 1
 
-            day_events: list[tuple[int, str]] = []
-            for level, mean in profile.per_day.items():
-                # +/-30% jitter so no two days are identical.
-                count = max(0, int(mean * rng.uniform(0.7, 1.3)))
-                for when in _spread_timestamps(rng, day_start, day_upper, count):
-                    msg = _event_message(rng, when, service, level, profile)
-                    day_events.append((int(when.timestamp() * 1000), msg))
-                    tally[service][level] = tally[service].get(level, 0) + 1
+        _flush(client, args.log_group, service, events)
 
-            # Counts are tracked via `tally`; _flush's return is unused here.
-            _flush(client, args.log_group, stream, day_events)
-
-    # Inject the incident as a tight ERROR burst on its own day.
+    # Incident burst: ``count`` ERROR events with the distinctive
+    # error_code, spread uniformly across the last
+    # ``_INCIDENT_BURST_MINUTES`` minutes (well inside the main window).
     if spec.incident:
         inc = spec.incident
         profile = spec.profiles[inc.service]
         _ensure_stream(client, args.log_group, inc.service)
-        # Anchor the incident to UTC MIDNIGHT (not the hour-floored `base`)
-        # so `start_hour` is a real wall-clock UTC hour: the burst lands at
-        # exactly inc.start_hour:00 UTC, inc.day_offset days ago. This makes
-        # the suggested demo prompt ("~3 days ago, 14:00-16:00 UTC") true
-        # regardless of what hour the operator runs the seed. Still well
-        # inside the 14-day backdating limit (day_offset is small).
-        midnight = base.replace(hour=0)
-        day_start = midnight - timedelta(days=inc.day_offset)
-        win_start = day_start + timedelta(hours=inc.start_hour)
-        win_end = win_start + timedelta(hours=inc.duration_hours)
+        burst_window_sec = _INCIDENT_BURST_MINUTES * 60
         burst: list[tuple[int, str]] = []
         for _ in range(inc.count):
-            offset = rng.random() * inc.duration_hours
-            when = win_start + timedelta(hours=offset)
-            if when >= now:
-                continue
+            offset_sec = rng.uniform(0, burst_window_sec)
+            ts_ms = now_ms - int(offset_sec * 1000)
+            when = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
             msg = _event_message(
                 rng,
                 when,
@@ -354,15 +330,17 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
                 error_code=inc.error_code,
                 message_override=inc.message,
             )
-            burst.append((int(when.timestamp() * 1000), msg))
+            burst.append((ts_ms, msg))
         _flush(client, args.log_group, inc.service, burst)
         tally[inc.service]["ERROR"] = (
             tally[inc.service].get("ERROR", 0) + len(burst)
         )
+        burst_start = now - timedelta(minutes=_INCIDENT_BURST_MINUTES)
         spec.notes.append(
             f"INCIDENT seeded: service='{inc.service}' "
-            f"error_code='{inc.error_code}' window="
-            f"{win_start.isoformat()} .. {win_end.isoformat()}"
+            f"error_code='{inc.error_code}' "
+            f"count={inc.count} within last {_INCIDENT_BURST_MINUTES} min "
+            f"({burst_start.isoformat()} .. {now.isoformat()})"
         )
 
     print("\nper-service counts:")

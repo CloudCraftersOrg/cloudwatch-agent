@@ -310,8 +310,27 @@ prompts. Phase 2 deliberately changes the data so the agent must adapt:
 Run each script **exactly once**. Re-runs are not idempotent —
 timestamps are recomputed from the wall clock, so CloudWatch accepts the
 events as new and the data is duplicated. week2 is designed to append to
-week1; to restart the whole demo, delete the log group first (see
-Cleanup) and re-seed.
+week1.
+
+> **Do NOT `aws logs delete-log-group` between seed runs.** Logs Insights
+> only indexes events whose timestamp is ≥ the log group's
+> `creationTime`. The seeds backdate events 6-13 days into the past
+> (the "two real weeks" narrative), so any event written right after
+> recreating the log group is invisible to Insights — `start_query`
+> returns `MalformedQueryException` or `scanned=0` even though the
+> events are stored and the Console "Log events" tab shows them. The
+> agent works around this by preferring `filter_log_events` over Logs
+> Insights for backdated data (see [app/prompts.py](app/prompts.py)),
+> but the Insights MCP tools will not work. To start cleanly, delete
+> the individual streams instead so the log group's `creationTime`
+> stays old:
+>
+> ```bash
+> for s in payments orders auth gateway checkout; do
+>   aws logs delete-log-stream --log-group-name /cloudwatch-agent/demo \
+>     --log-stream-name "$s" --region us-east-1 2>/dev/null
+> done
+> ```
 
 The scripts run with your AWS credentials (not the agent role) and need
 `logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`, and
@@ -338,6 +357,10 @@ then `destroy`.
 
 Delete the demo log group separately (Terraform does not manage it):
 `aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-east-1`.
+This is fine at the very end of the demo (you're tearing the whole
+stack down). But if you plan to re-seed and demo again, delete the
+streams individually instead (see "Demo data & flow" above), so Logs
+Insights stays usable on the next run.
 
 This removes the AgentCore Runtime endpoint, the runtime, the memory
 resource, the IAM role, the ECR repository (including all images), and

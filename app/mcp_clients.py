@@ -95,11 +95,22 @@ except Exception as exc:  # noqa: BLE001 — degrade gracefully on startup failu
 # Grafana MCP (Grafana Labs)
 # ---------------------------------------------------------------------------
 
-# Token TTL handed to the Grafana MCP server. Sized so a typical
-# AgentCore Runtime microVM lifetime fits inside it; calls start 401-ing
-# once the token expires (deferred rotation logic — bump this or
-# implement refresh if containers regularly outlive 8h).
-_GRAFANA_TOKEN_TTL_SECONDS = 28800  # 8 hours
+# Token TTL handed to the Grafana MCP server. Kept short on purpose:
+# AgentCore Runtime kills containers without SIGTERM most of the time,
+# so the atexit cleanup that deletes our token doesn't always fire and
+# tokens leak. AMG caps ~10 active tokens per service account, so a
+# long TTL + frequent restarts hits ServiceQuotaExceededException
+# ("Service Account Token quota has been reached"). 1 hour is long
+# enough for any practical invocation, short enough that leaked tokens
+# expire before they pile up. We ALSO actively delete stale "agent-mcp-"
+# tokens at startup (see _start_grafana_mcp), which is the real
+# defense against quota exhaustion.
+_GRAFANA_TOKEN_TTL_SECONDS = 3600  # 1 hour
+
+# Prefix used for tokens this module mints. Used at startup to identify
+# and delete leaked tokens from previous containers before minting a
+# fresh one (without this, ~10 leaks across restarts → quota error).
+_AGENT_TOKEN_NAME_PREFIX = "agent-mcp-"
 
 
 def _start_grafana_mcp() -> tuple[list, object | None]:
@@ -122,11 +133,51 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
         return [], None
 
     grafana_ctl = boto3.client("grafana", region_name=REGION)
+
+    # Best-effort: delete any tokens left over from previous containers
+    # that didn't shut down gracefully. AMG enforces ~10 active tokens
+    # per service account; without this we hit
+    # ServiceQuotaExceededException after enough restarts. We only
+    # delete tokens whose name carries our prefix, so the Terraform
+    # provisioner token (in a different service account anyway) is
+    # untouched.
+    try:
+        leftover = grafana_ctl.list_workspace_service_account_tokens(
+            workspaceId=GRAFANA_WORKSPACE_ID,
+            serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
+        ).get("serviceAccountTokens", [])
+        for tok in leftover:
+            if tok.get("name", "").startswith(_AGENT_TOKEN_NAME_PREFIX):
+                try:
+                    grafana_ctl.delete_workspace_service_account_token(
+                        workspaceId=GRAFANA_WORKSPACE_ID,
+                        serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
+                        tokenId=tok["id"],
+                    )
+                    logger.info(
+                        "Cleaned leftover Grafana token: %s", tok["id"]
+                    )
+                except Exception as del_exc:  # noqa: BLE001
+                    logger.debug(
+                        "Could not delete leftover token %s: %s",
+                        tok.get("id"),
+                        del_exc,
+                    )
+    except Exception as list_exc:  # noqa: BLE001
+        # Listing is best-effort; if the IAM lacks the permission we
+        # just proceed and hope we're under quota. Worst case: a future
+        # restart hits the cap and the manual drain script in README
+        # is needed.
+        logger.warning(
+            "Could not list existing Grafana tokens (continuing): %s",
+            list_exc,
+        )
+
     try:
         created = grafana_ctl.create_workspace_service_account_token(
             workspaceId=GRAFANA_WORKSPACE_ID,
             serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
-            name=f"agent-mcp-{uuid.uuid4().hex[:12]}",
+            name=f"{_AGENT_TOKEN_NAME_PREFIX}{uuid.uuid4().hex[:12]}",
             secondsToLive=_GRAFANA_TOKEN_TTL_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001

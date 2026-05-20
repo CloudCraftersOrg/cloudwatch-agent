@@ -22,7 +22,11 @@
       "Bash(uv sync *)",
       "Bash(.venv/bin/which awslabs.cloudwatch-mcp-server)",
       "Bash(python3 -m py_compile app/tools/logs.py app/prompts.py)",
-      "WebFetch(domain:grafana.com)"
+      "WebFetch(domain:grafana.com)",
+      "Bash(python3 -m py_compile app/main.py)",
+      "Bash(python3 -m py_compile seeds/*.py app/*.py app/tools/*.py)",
+      "Bash(python3 -m py_compile seeds/_common.py seeds/week1.py seeds/week2.py)",
+      "Bash(python3 -m py_compile app/mcp_clients.py)"
     ]
   }
 }

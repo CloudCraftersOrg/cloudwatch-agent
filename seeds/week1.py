@@ -1,8 +1,11 @@
 """Week 1 seed: the baseline.
 
-Writes ~7 days of data ending ~6 days ago (so it stays well under the
-14-day CloudWatch Logs backdating limit while still being a distinct
-calendar week from week 2).
+Writes ~7 "days worth" of events (per the per-day counts below × the
+SeedSpec ``num_days`` volume scalar) **spread uniformly over the last
+``WINDOW_MINUTES`` minutes** (see ``seeds/_common.py``). The old
+"two real weeks" backdating was dropped because Logs Insights refuses
+to index events whose timestamp is before the log group's creationTime
+— see the docstring in ``seeds/_common.py`` for the full rationale.
 
 The shape here is deliberately steady so the first dashboard set the
 agent builds has stable, meaningful panels:
@@ -86,10 +89,10 @@ SPEC = SeedSpec(
     profiles=PROFILES,
     incident=None,
     notes=[
-        "Baseline week written. Suggested prompt: \"Look at the logs in "
-        "the /cloudwatch-agent/demo log group for the last 14 days and "
-        "create a Grafana dashboard set: one overview plus one dashboard "
-        "per service (payments, orders, auth, gateway).\"",
+        "Baseline written. Suggested prompt: \"Look at the logs in the "
+        "/cloudwatch-agent/demo log group for the last hour and create "
+        "a Grafana dashboard set: one overview plus one dashboard per "
+        "service (payments, orders, auth, gateway).\"",
         "Remember the 'payments' WARN 'retrying downstream dependency' "
         "pattern — week 2 removes it so that dashboard goes stale.",
     ],

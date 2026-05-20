@@ -18,6 +18,7 @@ boto3 clients are reused because they are thread-safe for our read APIs.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
@@ -125,7 +126,28 @@ async def invoke(payload, context):
 
     # Stream events back to the client so the user sees incremental
     # progress (especially useful for long tool-using turns).
+    #
+    # Filter out Strands' internal diagnostic events. ``stream_async``
+    # yields two classes of events:
+    #   - JSON-serializable dicts (the Bedrock Converse stream events
+    #     the client consumes — content deltas, tool use deltas, message
+    #     snapshots, control signals).
+    #   - Diagnostic dicts that embed live Python objects
+    #     (``Agent``, ``Trace``, ``NonRecordingSpan``, ``AgentResult``).
+    #     When AgentCore serializes the latter, json.dumps fails and the
+    #     runtime falls back to ``str(dict)`` — emitting Python ``repr``
+    #     blobs per event. A single short conversation produces ~30 MB
+    #     of SSE that way, which crashes browser SSE readers with
+    #     "Error processing response: network error".
+    # Try-json.dumps drops the bad ones; the cost is negligible (~µs per
+    # event, few thousand events per invoke).
     async for event in agent.stream_async(user_message):
+        if not isinstance(event, dict):
+            continue
+        try:
+            json.dumps(event)
+        except (TypeError, ValueError):
+            continue
         yield event
 
 

@@ -125,6 +125,10 @@ data "aws_iam_policy_document" "runtime_permissions" {
     actions = [
       "grafana:CreateWorkspaceServiceAccountToken",
       "grafana:DeleteWorkspaceServiceAccountToken",
+      # Listing lets app/mcp_clients.py purge stale "agent-mcp-*"
+      # tokens at startup so the per-SA quota (~10) doesn't run out
+      # when AgentCore restarts containers without graceful shutdown.
+      "grafana:ListWorkspaceServiceAccountTokens",
     ]
     resources = [aws_grafana_workspace.this.arn]
   }

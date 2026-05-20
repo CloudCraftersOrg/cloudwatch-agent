@@ -1,7 +1,9 @@
-"""Week 2 seed: the evolved week (appended on top of week 1).
+"""Week 2 seed: the evolved phase (appended on top of week 1).
 
-Writes ~7 days of data ending now. It does NOT delete week 1 — it layers
-a changed profile so the agent, on a fresh prompt, must:
+Writes ~7 "days worth" of events (per per-day counts × ``num_days``)
+**spread uniformly over the last ``WINDOW_MINUTES`` minutes** (see
+``seeds/_common.py``). It does NOT delete week 1 — it layers a changed
+profile so the agent, on a fresh prompt, must:
 
 1. Regenerate the set: the ``payments`` "retrying downstream dependency"
    WARN pattern is GONE (issue fixed), so a week-1 payments dashboard
@@ -10,7 +12,9 @@ a changed profile so the agent, on a fresh prompt, must:
 2. Add a new dashboard with new scope: a brand-new ``checkout`` service
    appears that did not exist in week 1.
 3. Build an incident dashboard: a sharp ``orders`` outage
-   (``OrderDBConnectionPoolExhausted``) is injected in a ~2h window.
+   (``OrderDBConnectionPoolExhausted``) is injected as a tight burst in
+   the last few minutes (within the same ``WINDOW_MINUTES`` window as
+   the rest of the data — see Incident in ``seeds/_common.py``).
 
 Run (after week1 and after building the first dashboard set):
     uv run python -m seeds.week2
@@ -85,12 +89,16 @@ PROFILES: dict[str, ServiceProfile] = {
     ),
 }
 
-# Sharp, unambiguous outage 3 days ago, 14:00-16:00 UTC, in orders.
+# Sharp, unambiguous orders outage as a tight ERROR burst at the END of
+# the seed window (last ~10 minutes — see _INCIDENT_BURST_MINUTES in
+# seeds/_common.py). day_offset/start_hour/duration_hours are kept for
+# dataclass backward compatibility but are IGNORED by run_seed under
+# the new "recent window" model.
 INCIDENT = Incident(
     service="orders",
-    day_offset=3,
-    start_hour=14,
-    duration_hours=2,
+    day_offset=3,        # legacy, ignored
+    start_hour=14,       # legacy, ignored
+    duration_hours=2,    # legacy, ignored
     count=260,
     error_code="OrderDBConnectionPoolExhausted",
     message="order DB connection pool exhausted; requests timing out",
@@ -110,9 +118,10 @@ SPEC = SeedSpec(
         "NEW service 'checkout' exists only in week 2. Prompt: "
         "\"Regenerate the dashboard set; add any service that now has "
         "logs but no dashboard yet.\"",
-        "Incident prompt: \"There was an orders outage ~3 days ago around "
-        "14:00-16:00 UTC (OrderDBConnectionPoolExhausted). Build a "
-        "dedicated incident dashboard for it.\"",
+        "Incident prompt: \"There was a recent orders outage "
+        "(OrderDBConnectionPoolExhausted) in the last few minutes — "
+        "see the printed window above. Build a dedicated incident "
+        "dashboard for it.\"",
     ],
 )
 
