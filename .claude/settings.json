@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(command -v terraform)",
+      "Bash(grep -n -E '^\\\\s*# \\(-{5,}|#{5,}\\)\\\\s*$' terraform/iam.tf terraform/outputs.tf)",
+      "Bash(python3 -c ' *)",
+      "Bash(.venv/bin/python -)",
+      "Bash(/Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/.venv/bin/python -)",
+      "Bash(uv run *)",
+      "Bash(python3 -m py_compile app/*.py app/tools/*.py seeds/*.py)",
+      "Bash(echo \"fmt exit: $?\")",
+      "Bash(terraform -chdir=terraform validate -no-color)",
+      "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('app/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/prompts.py'\\).read\\(\\)\\); print\\('AST parse OK'\\)\")",
+      "Bash(echo \"tf fmt exit: $?\")"
+    ]
+  }
+}

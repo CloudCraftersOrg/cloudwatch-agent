@@ -1,0 +1,49 @@
+# Anything that is not needed inside the image. Keeping this list
+# aggressive shaves seconds off `docker build` context upload.
+
+# VCS metadata
+.git/
+.gitignore
+
+# Python build/runtime junk
+__pycache__/
+*.py[cod]
+.venv/
+
+# Tooling cache (ruff is the only configured dev tool).
+.ruff_cache/
+
+# Demo seed scripts are operator-run; the image only needs app/.
+seeds/
+
+# Editor metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Terraform — never relevant inside the container.
+terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+.terraform/
+
+# CI configuration — not used at runtime.
+.github/
+
+# Documentation that doesn't ship with the image.
+README.md
+LICENSE
+
+# Local secrets (defense in depth — should never exist in the repo
+# either, but if they do, don't bake them into the image).
+.env
+.env.*
+*.pem
+*.key

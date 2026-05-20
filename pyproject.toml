@@ -1,0 +1,64 @@
+# ###########################################################################
+# Project metadata for the CloudWatch Agent.
+#
+# Managed exclusively with `uv`. The lock file (uv.lock) is the source of
+# truth for resolved versions; this file pins only the loosest acceptable
+# constraints so that `uv sync` produces a reproducible environment.
+# ###########################################################################
+[project]
+name = "cloudwatch-agent"
+version = "0.1.0"
+description = "AI agent that reads Amazon CloudWatch and generates dashboards, served on Bedrock AgentCore Runtime."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { file = "LICENSE" }
+
+# Runtime dependencies. Kept intentionally small:
+#   - bedrock-agentcore: AgentCore Runtime SDK (BedrockAgentCoreApp + Memory integrations).
+#   - strands-agents:    Strands Agent framework (LLM reasoning loop + @tool decorator).
+#   - boto3:             AWS SDK used by the tool implementations to call CloudWatch, EC2, RDS, Lambda.
+#   - aws-opentelemetry-distro: OTEL distro that ships the AWS exporters AgentCore expects
+#                               for built-in observability (traces/metrics/logs to CloudWatch).
+dependencies = [
+    "bedrock-agentcore",
+    "strands-agents",
+    "boto3",
+    "aws-opentelemetry-distro>=0.10.1",
+]
+
+[dependency-groups]
+# Development dependencies. Only ruff for now — tests are intentionally
+# out of scope per the project brief.
+dev = [
+    "ruff",
+]
+
+# ###########################################################################
+# uv-specific configuration. We pin the build backend to setuptools so that
+# `uv build` and editable installs work without any custom configuration.
+# ###########################################################################
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Only the `app` package ships with the project. Everything else (terraform,
+# .github, Dockerfile) is repository tooling, not Python code.
+include = ["app*"]
+
+# ###########################################################################
+# Ruff configuration. Defaults are sensible; we only widen the line length
+# to 100 (matching the comment style used throughout this repo) and target
+# the same Python version we run on.
+# ###########################################################################
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+# Enable a small but useful rule set:
+#   E, F  -> pycodestyle errors + pyflakes (default).
+#   I     -> import sorting (replaces isort).
+#   B     -> flake8-bugbear (catches common Python footguns).
+#   UP    -> pyupgrade (keeps syntax modern for the target version).
+select = ["E", "F", "I", "B", "UP"]

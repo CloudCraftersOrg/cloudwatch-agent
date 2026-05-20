@@ -1,0 +1,24 @@
+# ###########################################################################
+# Sample variable file. Copy to `terraform.tfvars` and edit as needed.
+# `terraform.tfvars` is gitignored so any local edits stay out of VCS.
+# ###########################################################################
+
+# Logical name used as a prefix for every named resource.
+# project_name = "cloudwatch-agent"
+
+# AWS region. Single-region project; only us-west-2 is tested.
+# region = "us-west-2"
+
+# Image tag to deploy. CI overrides this with the commit SHA on every
+# push to main. For the phased bootstrap (see README), you push a
+# "latest" image before the full apply, so the default "latest" is fine.
+# image_tag = "latest"
+
+# Grafana engine version for the Amazon Managed Grafana workspace.
+# grafana_version = "10.4"
+
+# IAM Identity Center group IDs granted Grafana ADMIN (so humans can log
+# in and view the dashboards the agent creates). Empty by default, in
+# which case you assign access manually in the AMG console after apply.
+# These are Identity Center group UUIDs, not group names.
+# grafana_admin_group_ids = ["xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
