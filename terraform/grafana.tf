@@ -11,20 +11,71 @@
 # Human login uses AWS IAM Identity Center (SSO); the agent never uses SSO.
 # #############################################################################
 
+# #############################################################################
+# Workspace IAM role. With CURRENT_ACCOUNT, the AMG CreateWorkspace API
+# requires an explicit workspaceRoleArn (the "SERVICE_MANAGED auto-creates a
+# role for you" path is no longer accepted by the API and now fails with
+# "ValidationException: When the accountAccessType is CURRENT_ACCOUNT a
+# Workspace Role ARN should be provided."), so we provision the role
+# ourselves under CUSTOMER_MANAGED and attach AWS's managed
+# AmazonGrafanaCloudWatchAccess policy. That policy covers both CloudWatch
+# metrics (ListMetrics / GetMetricData) AND Logs Insights (StartQuery /
+# GetQueryResults / DescribeLogGroups / ...), so authType="default" on the
+# CloudWatch data source resolves to this role for every read — matching
+# what SERVICE_MANAGED + data_sources=["CLOUDWATCH"] used to do.
+# #############################################################################
+data "aws_iam_policy_document" "grafana_workspace_trust" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRole"]
+
+    principals {
+      type        = "Service"
+      identifiers = ["grafana.amazonaws.com"]
+    }
+
+    # Lock the assume to this account.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+
+    # Lock the assume to any AMG workspace in this account/region.
+    # Wildcard (rather than the workspace ARN) avoids the trust-policy /
+    # workspace circular dependency; aws:SourceAccount already binds it
+    # to our account, so this is still confused-deputy safe.
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:grafana:${local.region}:${local.account_id}:/workspaces/*"]
+    }
+  }
+}
+
+resource "aws_iam_role" "grafana_workspace" {
+  name               = "${var.project_name}-grafana-workspace"
+  assume_role_policy = data.aws_iam_policy_document.grafana_workspace_trust.json
+  description        = "Role the AMG workspace assumes to query its CloudWatch data source (metrics + Logs Insights)."
+}
+
+resource "aws_iam_role_policy_attachment" "grafana_workspace_cloudwatch" {
+  role       = aws_iam_role.grafana_workspace.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonGrafanaCloudWatchAccess"
+}
+
 resource "aws_grafana_workspace" "this" {
   name        = replace(var.project_name, "-", "_")
   description = "Workspace where the CloudWatch Agent publishes generated dashboards."
 
-  # SERVICE_MANAGED lets AMG create and maintain the workspace IAM role with
-  # CloudWatch read access for the data sources listed below; we don't have to
-  # hand-craft that role. CURRENT_ACCOUNT keeps data access to this account.
+  # CUSTOMER_MANAGED + an explicit role we own (above). CURRENT_ACCOUNT
+  # keeps data access to this account. data_sources is intentionally
+  # omitted: that argument is a SERVICE_MANAGED hint for the role AWS
+  # would create, and is meaningless when we provide the role ourselves.
   account_access_type      = "CURRENT_ACCOUNT"
-  permission_type          = "SERVICE_MANAGED"
+  permission_type          = "CUSTOMER_MANAGED"
+  role_arn                 = aws_iam_role.grafana_workspace.arn
   authentication_providers = ["AWS_SSO"]
-
-  # Grant the workspace role the managed CloudWatch access policy so the
-  # native CloudWatch data source can query metrics and Logs.
-  data_sources = ["CLOUDWATCH"]
 
   grafana_version = var.grafana_version
 }
@@ -76,14 +127,50 @@ resource "grafana_data_source" "cloudwatch" {
 }
 
 # #############################################################################
-# Optional: grant IAM Identity Center groups ADMIN on the workspace. Created
-# only when group IDs are supplied; otherwise human access is assigned by hand
-# in the AMG console. Does not affect the agent (it uses a service account).
+# Human access via IAM Identity Center.
+#
+# AMG does not grant SSO logins access by default — an unassociated user
+# lands on "Login failed [sso.auth.access-denied]". We therefore wire up
+# two complementary role associations, both opt-in:
+#
+#   1. grafana_admin_group_ids: explicit ADMIN access for named groups.
+#      Defaults to []; if set, those Identity Center groups become
+#      workspace ADMINs.
+#
+#   2. grafana_grant_all_users_role: auto-discovers every user in the
+#      account's Identity Center store and grants them this role
+#      (default VIEWER). Set to "" to disable. The data sources below
+#      are only consulted when the variable is non-empty.
 # #############################################################################
 resource "aws_grafana_role_association" "admin" {
   count = length(var.grafana_admin_group_ids) > 0 ? 1 : 0
 
   role         = "ADMIN"
   group_ids    = var.grafana_admin_group_ids
+  workspace_id = aws_grafana_workspace.this.id
+}
+
+# Identity Center instance lookup. There is exactly one Identity Center
+# instance per account (or AWS Organization payer); take the first ARN /
+# identity store id from the list.
+data "aws_ssoadmin_instances" "this" {
+  count = var.grafana_grant_all_users_role != "" ? 1 : 0
+}
+
+# All users in that identity store. Re-read on every apply, so newly
+# onboarded Identity Center users get access on the next apply.
+data "aws_identitystore_users" "all" {
+  count             = var.grafana_grant_all_users_role != "" ? 1 : 0
+  identity_store_id = tolist(data.aws_ssoadmin_instances.this[0].identity_store_ids)[0]
+}
+
+# Grant every Identity Center user the configured role. user_ids is a
+# flat list; AMG handles association creation/removal in-place when the
+# set changes between applies.
+resource "aws_grafana_role_association" "all_users" {
+  count = var.grafana_grant_all_users_role != "" ? 1 : 0
+
+  role         = var.grafana_grant_all_users_role
+  user_ids     = [for u in data.aws_identitystore_users.all[0].users : u.user_id]
   workspace_id = aws_grafana_workspace.this.id
 }

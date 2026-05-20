@@ -12,7 +12,11 @@
       "Bash(echo \"fmt exit: $?\")",
       "Bash(terraform -chdir=terraform validate -no-color)",
       "Bash(.venv/bin/python -c \"import ast; ast.parse\\(open\\('app/main.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/prompts.py'\\).read\\(\\)\\); print\\('AST parse OK'\\)\")",
-      "Bash(echo \"tf fmt exit: $?\")"
+      "Bash(echo \"tf fmt exit: $?\")",
+      "Bash(echo \"fmt check exit: $?\")",
+      "Bash(terraform -chdir=terraform console)",
+      "Bash(echo \"fmt: $?\")",
+      "Bash(terraform -chdir=/Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/terraform validate -no-color)"
     ]
   }
 }

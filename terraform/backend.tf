@@ -14,10 +14,9 @@
 # ###########################################################################
 terraform {
   backend "s3" {
-    bucket         = "<your-terraform-state-bucket>"
-    key            = "cloudwatch-agent/terraform.tfstate"
-    region         = "us-west-2"
-    dynamodb_table = "<your-terraform-locks-table>"
-    encrypt        = true
+    bucket  = "sacm-development-tfstate"
+    key     = "cloudwatch-agent/terraform.tfstate"
+    region  = "us-west-2"
+    encrypt = true
   }
 }

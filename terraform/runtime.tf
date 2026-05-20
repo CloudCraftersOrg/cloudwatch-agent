@@ -3,8 +3,13 @@
 # Bedrock AgentCore Runtime and invocation endpoint
 #
 # Purpose: The runtime is a managed microVM-backed service that pulls the agent
-# container image from ECR and exposes the agent over HTTPS. The endpoint is the
-# named, invocable handle that callers target (DEFAULT here).
+# container image from ECR and exposes the agent over HTTPS. AgentCore
+# auto-provisions a DEFAULT endpoint when the runtime is created; callers
+# invoke the runtime ARN with `--qualifier DEFAULT` (see README "Invoking the
+# agent"). There is no separate Terraform resource for the DEFAULT endpoint
+# because the AgentCore Control API rejects a manual create with
+# ConflictException. Add non-default endpoints (e.g., CANARY) by declaring
+# aws_bedrockagentcore_agent_runtime_endpoint resources with a different name.
 # #############################################################################
 
 resource "aws_bedrockagentcore_agent_runtime" "this" {
@@ -12,12 +17,18 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
   description        = "AgentCore Runtime hosting the CloudWatch Agent container."
   role_arn           = aws_iam_role.runtime.arn
 
-  # Container image to run. Tag is overridden per-deploy by CI so the runtime always points at a known-good immutable artifact (commit SHA), not the floating "latest" tag.
+  # Container image to run. local.image_uri is content-addressed (tag is
+  # the first 12 chars of sha1(Dockerfile + pyproject + uv.lock + app/));
+  # the depends_on ensures Terraform builds and pushes the image (via
+  # terraform_data.image in build.tf) BEFORE updating container_uri here,
+  # so AgentCore never tries to pull a tag that does not yet exist.
   agent_runtime_artifact {
     container_configuration {
-      container_uri = "${aws_ecr_repository.this.repository_url}:${var.image_tag}"
+      container_uri = local.image_uri
     }
   }
+
+  depends_on = [terraform_data.image]
 
   # PUBLIC network mode: runtime hosts the agent on a service-managed public endpoint (IAM auth in front). VPC mode is for private resources, but this agent only calls AWS APIs over the internet.
   network_configuration {
@@ -46,12 +57,5 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
   }
 }
 
-# #############################################################################
-# DEFAULT endpoint. Callers invoke `arn ... :runtime/<id>` with this qualifier.
-# Future endpoints (e.g., CANARY for blue/green) can be added without touching the runtime resource.
-# #############################################################################
-resource "aws_bedrockagentcore_agent_runtime_endpoint" "default" {
-  agent_runtime_id = aws_bedrockagentcore_agent_runtime.this.agent_runtime_id
-  name             = "DEFAULT"
-  description      = "Default invocable endpoint for the CloudWatch Agent runtime."
-}
+# (See the resource header above — the DEFAULT endpoint is auto-created
+# alongside the runtime, so no resource is declared here.)

@@ -14,10 +14,10 @@ output "agent_runtime_arn" {
   value       = aws_bedrockagentcore_agent_runtime.this.agent_runtime_arn
 }
 
-output "agent_runtime_endpoint_arn" {
-  description = "ARN of the DEFAULT invocable endpoint. Callers pass this to bedrock-agentcore invoke-agent-runtime."
-  value       = aws_bedrockagentcore_agent_runtime_endpoint.default.agent_runtime_endpoint_arn
-}
+# NOTE: there is no agent_runtime_endpoint_arn output because the DEFAULT
+# endpoint is implicit on the runtime (AgentCore auto-creates it and
+# rejects an explicit CreateAgentRuntimeEndpoint with that name). Callers
+# invoke the runtime by ARN with --qualifier DEFAULT (see README).
 
 output "ecr_repository_url" {
   description = "ECR repository URL. Used by CI as the docker image push target."

@@ -20,19 +20,12 @@ variable "region" {
   default     = "us-west-2"
 }
 
-# Container image tag deployed by the AgentCore Runtime. CI overrides this with
-# the commit SHA on every push to main. Default is "latest" for the initial
-# manual bootstrap apply.
-#
-# DRIFT WARNING: Terraform does not persist -var values. After CI has deployed
-# with -var="image_tag=<sha>", a bare `terraform apply` (no -var) on the same
-# state reverts the runtime to ":latest". Post-bootstrap, always pass
-# -var="image_tag=<sha>" (the CI workflow does this automatically).
-variable "image_tag" {
-  description = "ECR image tag for the AgentCore Runtime container. Overridden by CI to the commit SHA. Always pass explicitly after bootstrap (see DRIFT WARNING in variables.tf)."
-  type        = string
-  default     = "latest"
-}
+# NOTE: the container image tag is no longer a variable. It is derived from
+# a sha1 of the image source files (Dockerfile, pyproject.toml, uv.lock,
+# app/) by terraform/build.tf, and the image is built and pushed during
+# `terraform apply`. Any code change automatically produces a new
+# content-addressed tag, so drift between the deployed runtime and the
+# pushed image is impossible by construction.
 
 # Grafana engine version for the Amazon Managed Grafana workspace. Pinned so
 # that AMG upgrades are an explicit, reviewed change rather than implicit drift.
@@ -51,4 +44,22 @@ variable "grafana_admin_group_ids" {
   description = "IAM Identity Center group IDs to grant Grafana ADMIN. Empty = assign humans manually."
   type        = list(string)
   default     = []
+}
+
+# Grant the same Grafana role to EVERY IAM Identity Center user in the
+# account's identity store. Without an association, an SSO login lands on
+# "Login failed [sso.auth.access-denied]"; AMG does not grant access
+# implicitly. Defaults to VIEWER so everyone can see the dashboards the
+# agent creates (and VIEWER is the cheapest AMG user tier). Set to
+# "EDITOR" if you want everyone to be able to modify dashboards too,
+# "ADMIN" for full control, or "" to disable the auto-grant and assign
+# users by hand in the AMG console / via grafana_admin_group_ids.
+variable "grafana_grant_all_users_role" {
+  description = "Grafana role granted to every Identity Center user (\"VIEWER\"|\"EDITOR\"|\"ADMIN\"). \"\" disables the auto-grant."
+  type        = string
+  default     = "VIEWER"
+  validation {
+    condition     = contains(["", "VIEWER", "EDITOR", "ADMIN"], var.grafana_grant_all_users_role)
+    error_message = "grafana_grant_all_users_role must be one of: \"\", \"VIEWER\", \"EDITOR\", \"ADMIN\"."
+  }
 }

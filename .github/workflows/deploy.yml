@@ -1,10 +1,11 @@
 # ###########################################################################
-# Production deploy: build the agent image for ARM64, push to ECR, and
-# update the AgentCore Runtime via `terraform apply`.
+# Production deploy: a single `terraform apply` builds the linux/arm64
+# image, pushes it to ECR (via terraform_data.image in terraform/build.tf),
+# and updates the AgentCore Runtime to the new content-addressed tag.
 #
-# Triggered on every push to main that touches the application code,
-# Terraform configuration, or the Dockerfile. Documentation-only changes
-# (README, etc.) do NOT redeploy.
+# Triggered on every push to main that touches anything that goes into the
+# image (app, deps, Dockerfile) or the Terraform configuration.
+# Documentation-only changes do NOT redeploy.
 #
 # Authentication uses GitHub OIDC against an IAM role in the target
 # AWS account; no static AWS credentials are stored in the repo.
@@ -18,6 +19,8 @@ on:
       - "app/**"
       - "terraform/**"
       - "Dockerfile"
+      - "pyproject.toml"
+      - "uv.lock"
 
 # OIDC requires id-token: write. contents: read is needed for actions/checkout.
 permissions:
@@ -32,7 +35,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Build image + terraform apply
+    name: terraform apply (builds + pushes image)
     runs-on: ubuntu-latest
     env:
       # Region is hardcoded here (single-region project) so it does not
@@ -47,53 +50,24 @@ jobs:
       # Exchange the GitHub OIDC token for short-lived AWS credentials.
       # AWS_ROLE_ARN is configured as a repository variable (or secret)
       # and points at a role whose trust policy allows this repo + branch.
+      # The role needs the usual Terraform-apply permissions PLUS ECR
+      # push (the build step inside terraform apply does docker login +
+      # docker push).
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN || secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Log in to ECR so docker buildx can push to the private registry.
-      - name: Log in to Amazon ECR
-        id: ecr-login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      # Register QEMU binfmt handlers so an amd64 runner can execute the
-      # arm64 RUN steps (uv sync). Without this the cross-arch build fails
-      # with "exec format error".
+      # Register QEMU binfmt handlers so the linux/arm64 build inside
+      # terraform_data.image can run on this amd64 runner.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      # Set up buildx; required for cross-architecture (ARM64) builds.
+      # buildx is required for the cross-architecture build invoked by
+      # terraform_data.image.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-
-      # Compute the image URI once so subsequent steps reference the
-      # same value. Repository name is hardcoded to match var.project_name
-      # in terraform/variables.tf; account/region come from the OIDC role.
-      - name: Compute image URI
-        id: image
-        run: |
-          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-          ECR_URL="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/cloudwatch-agent"
-          echo "ecr_url=${ECR_URL}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-
-      # Build for linux/arm64 and push directly to ECR. Tagged with the
-      # commit SHA (immutable, used by terraform) and `latest` (floating,
-      # convenience for ad-hoc invocations). --provenance=false forces a
-      # single-platform image manifest instead of buildx's default OCI
-      # image index + attestations, which AgentCore Runtime rejects with
-      # an opaque platform-mismatch error.
-      - name: Build and push container image
-        run: |
-          docker buildx build \
-            --platform linux/arm64 \
-            --provenance=false \
-            -t "${{ steps.image.outputs.ecr_url }}:${{ steps.image.outputs.tag }}" \
-            -t "${{ steps.image.outputs.ecr_url }}:latest" \
-            --push \
-            .
 
       # Install Terraform to match the version pinned in versions.tf.
       - name: Set up Terraform
@@ -108,9 +82,12 @@ jobs:
         working-directory: terraform
         run: terraform init
 
-      # Apply with the freshly built image. -auto-approve is safe here
-      # because every change has already been reviewed via the PR that
-      # produced this commit.
+      # Single command. terraform_data.image (terraform/build.tf) does
+      # docker login + buildx build --provenance=false --push, then the
+      # AgentCore Runtime updates its container_uri to the new
+      # content-addressed tag. -auto-approve is safe here because every
+      # change has already been reviewed via the PR that produced this
+      # commit.
       - name: terraform apply
         working-directory: terraform
-        run: terraform apply -auto-approve -var="image_tag=${{ steps.image.outputs.tag }}"
+        run: terraform apply -auto-approve

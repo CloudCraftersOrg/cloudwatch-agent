@@ -117,11 +117,14 @@ environment variable" error); the rest of the agent still runs.
 
 ## Deploy & test (step by step)
 
-Run everything from the repo root. The AgentCore Runtime needs a
-container image to exist in ECR *before* it is created, so the very first
-deploy is **phased**: create the ECR repo, push an image, then apply the
-rest. (`.github/workflows/deploy.yml` automates steps 4–6 on every push to
-`main` once this bootstrap has been done once.)
+Run everything from the repo root. A single `terraform apply` does the
+whole deploy: it creates the ECR repository, **builds and pushes the
+linux/arm64 agent image itself** (via `terraform_data.image` in
+[terraform/build.tf](terraform/build.tf)), then creates the AgentCore
+Runtime + Memory + AMG workspace + IAM. The image is tagged with a
+content hash of `Dockerfile` + `pyproject.toml` + `uv.lock` + `app/`, so
+the runtime always points at an immutable, traceable artifact and there
+is no `:latest` drift.
 
 **0. Preconditions**
 
@@ -130,7 +133,10 @@ rest. (`.github/workflows/deploy.yml` automates steps 4–6 on every push to
   resources below and `bedrock-agentcore:InvokeAgentRuntime`.
 - Claude Opus 4.6 enabled in Bedrock in `us-west-2`, and IAM Identity
   Center enabled in the account (see Prerequisites).
-- `uv`, Terraform ≥ 1.9, and Docker with buildx installed.
+- `uv`, Terraform ≥ 1.9, Docker with buildx, and AWS CLI v2 installed.
+  On an x86_64 host, also QEMU binfmt (`docker run --privileged --rm
+  tonistiigi/binfmt --install arm64`) so buildx can cross-compile to
+  linux/arm64; on Apple Silicon arm64 is native and you can skip this.
 
 **1. Configure variables (optional)**
 
@@ -142,51 +148,45 @@ This quick test uses **local Terraform state** — do *not* create
 `backend.tf`. (`backend.tf` + a real S3 bucket is only needed for the
 CI/CD pipeline, where state must be shared; see "CI/CD" below.)
 
-**2. Init + create only the ECR repository**
+**2. Deploy (single command)**
 
 ```bash
 terraform -chdir=terraform init
-terraform -chdir=terraform apply -target=aws_ecr_repository.this
-```
-
-**3. Build and push the agent image (tag `latest`)**
-
-```bash
-ECR_URL=$(terraform -chdir=terraform output -raw ecr_repository_url)
-aws ecr get-login-password --region us-west-2 \
-  | docker login --username AWS --password-stdin "${ECR_URL%%/*}"
-docker buildx build --platform linux/arm64 --provenance=false -t "${ECR_URL}:latest" --push .
-```
-
-The image is `linux/arm64` (AgentCore requirement). On Apple Silicon this
-is native; on an Intel host buildx uses QEMU emulation automatically.
-`--provenance=false` is required: it forces a single-platform image
-manifest instead of buildx's default OCI image index + attestations,
-which AgentCore Runtime rejects with an opaque platform-mismatch error.
-
-**4. Apply the full stack**
-
-```bash
 terraform -chdir=terraform apply
 ```
 
-This creates AgentCore Memory + strategies, the IAM role, the Amazon
-Managed Grafana workspace + service accounts + CloudWatch data source,
-and the AgentCore Runtime + endpoint (pointing at `:latest`). If the
-`grafana` provider errors because the workspace is not `ACTIVE` yet,
-just re-run `terraform -chdir=terraform apply`.
+That's it. The apply creates the ECR repository, then
+`terraform_data.image` runs `docker login` + `docker buildx build
+--platform linux/arm64 --provenance=false --push` against your local
+docker, then the AgentCore Runtime is created pointing at the freshly
+pushed content-addressed tag. The Amazon Managed Grafana workspace,
+CloudWatch data source, IAM role, and AgentCore Memory + strategies are
+created in the same apply. If the `grafana` provider errors because the
+workspace is not `ACTIVE` yet, just re-run the apply.
 
-**5. Grant yourself Grafana access (to view dashboards)**
+Subsequent applies only rebuild the image when the source files
+actually change (the hash drives `triggers_replace`), so a no-op apply
+is cheap.
 
-Set `grafana_admin_group_ids` in `terraform.tfvars` to your IAM Identity
-Center group ID(s) and re-apply, **or** assign your Identity Center user
-as ADMIN in the AMG console. Then open the workspace:
+**3. Open the Grafana workspace**
+
+By default, every IAM Identity Center user in the account is granted
+the `VIEWER` role on the workspace at apply time (controlled by the
+`grafana_grant_all_users_role` variable — set to `"EDITOR"` if you also
+want everyone to edit dashboards, `"ADMIN"` for full control, or `""` to
+opt out and assign access by hand). For named admin groups, set
+`grafana_admin_group_ids` in `terraform.tfvars` and re-apply. Then open
+the workspace:
 
 ```bash
 terraform -chdir=terraform output -raw grafana_workspace_url
 ```
 
-**6. Seed week 1 and build the first dashboard set**
+If a fresh SSO login lands on `Login failed [sso.auth.access-denied]`,
+the user has not been associated yet — re-run `terraform apply` to pick
+up new Identity Center users.
+
+**4. Seed week 1 and build the first dashboard set**
 
 ```bash
 uv run python -m seeds.week1          # prints suggested prompts
@@ -203,7 +203,7 @@ aws bedrock-agentcore invoke-agent-runtime \
   /tmp/agent.json && cat /tmp/agent.json
 ```
 
-**7. Seed week 2 and regenerate**
+**5. Seed week 2 and regenerate**
 
 ```bash
 uv run python -m seeds.week2          # prints what changed + prompts
@@ -214,7 +214,7 @@ uv run python -m seeds.week2          # prints what changed + prompts
 ```
 
 See "Demo data & flow" for exactly what week 2 changes and why. Verify
-the results in the Grafana workspace from step 5.
+the results in the Grafana workspace from step 3.
 
 Note: the `grafana/grafana` provider authenticates with a 30-day
 provisioner token Terraform creates. If an apply runs more than 30 days
@@ -223,18 +223,20 @@ after the previous one, taint it first:
 
 ## CI/CD
 
-After the bootstrap above, every push to `main` touching `app/**`,
-`terraform/**`, or `Dockerfile` runs `.github/workflows/deploy.yml`:
-build the `linux/arm64` image, push it tagged with the commit SHA, then
-`terraform apply -var="image_tag=<sha>"`. It requires an `AWS_ROLE_ARN`
-repo variable/secret (OIDC) and a **committed `backend.tf`** with a real
-S3 bucket — CI runners are ephemeral, so shared remote state is
-mandatory there (unlike the local quick test above).
+Every push to `main` touching `app/**`, `terraform/**`, `Dockerfile`,
+`pyproject.toml`, or `uv.lock` runs `.github/workflows/deploy.yml`, which
+is exactly one `terraform apply` — the build + push happens inside
+Terraform (`terraform_data.image`). The workflow sets up QEMU and
+buildx for the cross-arch build, then calls `terraform init` +
+`terraform apply -auto-approve`. It requires an `AWS_ROLE_ARN` repo
+variable/secret (OIDC, allowing both Terraform-apply and ECR-push
+permissions) and a **committed `backend.tf`** with a real S3 bucket —
+CI runners are ephemeral, so shared remote state is mandatory there
+(unlike the local quick test above).
 
-Terraform does not persist `-var` values. Once CI has deployed by SHA, a
-bare `terraform apply` (no `-var`) against the same state reverts the
-runtime to `:latest` — always pass `-var="image_tag=<sha>"` for any
-manual apply after the bootstrap (CI always does).
+Because the image tag is the sha1 of the image source files, the same
+commit always produces the same tag — no drift between what was last
+deployed and what `terraform apply` would deploy now.
 
 ## Invoking the agent (reference)
 
