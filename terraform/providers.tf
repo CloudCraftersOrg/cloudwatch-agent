@@ -21,6 +21,25 @@ provider "aws" {
   }
 }
 
+# Separate provider for IAM Identity Center data-source lookups (see
+# var.identity_center_region). aws_ssoadmin_instances and
+# aws_identitystore_users only see the instance from the region it was
+# created in, so when the deploy region differs from the Identity Center
+# home region we have to read those data sources via a region-specific
+# provider alias. Defaults to var.region; override via terraform.tfvars
+# when the two regions differ.
+provider "aws" {
+  alias  = "identity_center"
+  region = coalesce(var.identity_center_region, var.region)
+
+  default_tags {
+    tags = {
+      Project   = var.project_name
+      ManagedBy = "terraform"
+    }
+  }
+}
+
 provider "grafana" {
   # Amazon Managed Grafana exposes a standard Grafana HTTP API at the
   # workspace endpoint. The provider talks to that API as the Terraform

@@ -12,12 +12,12 @@ variable "project_name" {
   default     = "cloudwatch-agent"
 }
 
-# AWS region. Single-region project (us-west-2 by default). The variable exists
+# AWS region. Single-region project (us-east-1 by default). The variable exists
 # so contributors can spin up isolated stacks in other regions if needed.
 variable "region" {
   description = "AWS region to deploy into. The agent calls CloudWatch in this same region."
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-1"
 }
 
 # NOTE: the container image tag is no longer a variable. It is derived from
@@ -62,4 +62,18 @@ variable "grafana_grant_all_users_role" {
     condition     = contains(["", "VIEWER", "EDITOR", "ADMIN"], var.grafana_grant_all_users_role)
     error_message = "grafana_grant_all_users_role must be one of: \"\", \"VIEWER\", \"EDITOR\", \"ADMIN\"."
   }
+}
+
+# IAM Identity Center is account-global but its instance lives in ONE
+# specific region (the one it was enabled in). The data sources that
+# enumerate Identity Center users and groups (aws_ssoadmin_instances,
+# aws_identitystore_users) only return results from that home region —
+# calling them from any other region returns an empty list and the
+# auto-grant in grafana.tf errors with "Invalid index ... empty list".
+# Set this to the region where Identity Center was originally enabled
+# (commonly the account's first deploy region). null = use var.region.
+variable "identity_center_region" {
+  description = "Region where the account's IAM Identity Center instance was created. null = same as var.region. Set explicitly when Identity Center is in a different region than the deploy."
+  type        = string
+  default     = null
 }

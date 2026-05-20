@@ -39,7 +39,7 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
   environment_variables = {
     # Application config consumed by app/config.py.
     AWS_REGION = var.region
-    MODEL_ID   = "anthropic.claude-opus-4-6-v1"
+    MODEL_ID   = "us.anthropic.claude-opus-4-6-v1"
     MEMORY_ID  = aws_bedrockagentcore_memory.this.id
 
     # Grafana wiring. The agent mints a per-session token against the agent

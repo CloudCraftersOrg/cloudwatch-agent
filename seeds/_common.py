@@ -33,7 +33,7 @@ import boto3
 # group keeps the demo simple; the per-service split lives in the stream
 # name and the JSON ``service`` field.
 DEFAULT_LOG_GROUP = "/cloudwatch-agent/demo"
-DEFAULT_REGION = "us-west-2"
+DEFAULT_REGION = "us-east-1"
 RETENTION_DAYS = 30
 
 # PutLogEvents limits, with safety margins below the hard caps.

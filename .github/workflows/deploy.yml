@@ -41,7 +41,7 @@ jobs:
       # Region is hardcoded here (single-region project) so it does not
       # have to be threaded through repository variables. Keep aligned
       # with terraform/variables.tf:region default.
-      AWS_REGION: us-west-2
+      AWS_REGION: us-east-1
     steps:
       # Pull the commit being deployed into the workspace.
       - name: Checkout

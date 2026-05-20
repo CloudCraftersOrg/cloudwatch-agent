@@ -62,14 +62,14 @@ data "aws_iam_policy_document" "runtime_permissions" {
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
     ]
-    # The real foundation-model ARN Bedrock validates is
-    # arn:aws:bedrock:<region>::foundation-model/anthropic.claude-opus-4-6-v1
-    # (no ":0" suffix, contrary to older Claude IDs). The trailing "v1*"
-    # wildcard keeps the scope tight to this exact model family while
-    # being resilient to AWS adding a version suffix later. The "us."
-    # inference profile fans out invocations to us-east-1 / us-east-2 /
-    # us-west-2, so the cross-region foundation-model entry MUST cover
-    # any region.
+    # Opus 4.6 is inference-profile-only (the bare foundation model
+    # rejects on-demand invocation with ValidationException), so the
+    # agent calls the ``us.`` cross-region inference profile. That
+    # profile fans out to us-east-1 / us-east-2 / us-west-2, so the
+    # cross-region foundation-model wildcard MUST cover any region; the
+    # in-region foundation-model entry is the local leg of the same
+    # routing. ``v1*`` keeps the scope tight to this model family while
+    # being resilient to AWS adding a version suffix later.
     resources = [
       "arn:aws:bedrock:${local.region}::foundation-model/anthropic.claude-opus-4-6-v1*",
       "arn:aws:bedrock:${local.region}:${local.account_id}:inference-profile/us.anthropic.claude-opus-4-6-v1",

@@ -150,25 +150,53 @@ resource "aws_grafana_role_association" "admin" {
   workspace_id = aws_grafana_workspace.this.id
 }
 
-# Identity Center instance lookup. There is exactly one Identity Center
-# instance per account (or AWS Organization payer); take the first ARN /
-# identity store id from the list.
+# Identity Center instance lookup. Must run against the region where the
+# Identity Center instance was created (see var.identity_center_region) —
+# from any other region this data source returns an empty list and the
+# downstream resources error with "Invalid index ... empty list".
 data "aws_ssoadmin_instances" "this" {
-  count = var.grafana_grant_all_users_role != "" ? 1 : 0
+  count    = var.grafana_grant_all_users_role != "" ? 1 : 0
+  provider = aws.identity_center
+}
+
+locals {
+  # First identity_store_id returned by the instance lookup, or null when
+  # Identity Center is not present in identity_center_region. The null
+  # path lets the auto-grant degrade gracefully (no role association) so
+  # the rest of the stack still applies; we surface a clear hint via the
+  # validation block below instead of an opaque "empty list" error.
+  _sso_identity_store_id = (
+    var.grafana_grant_all_users_role != "" && length(data.aws_ssoadmin_instances.this) > 0
+    ? try(tolist(data.aws_ssoadmin_instances.this[0].identity_store_ids)[0], null)
+    : null
+  )
+}
+
+# Sanity check: if the user asked for the auto-grant but no Identity
+# Center instance was found in identity_center_region, fail fast with a
+# pointer to the variable instead of letting the apply continue silently.
+check "identity_center_present_when_auto_grant_enabled" {
+  assert {
+    condition = (
+      var.grafana_grant_all_users_role == "" || local._sso_identity_store_id != null
+    )
+    error_message = "grafana_grant_all_users_role is set but no IAM Identity Center instance was found in '${coalesce(var.identity_center_region, var.region)}'. Set identity_center_region in terraform.tfvars to the region where Identity Center was enabled, or set grafana_grant_all_users_role = \"\" to disable the auto-grant."
+  }
 }
 
 # All users in that identity store. Re-read on every apply, so newly
 # onboarded Identity Center users get access on the next apply.
 data "aws_identitystore_users" "all" {
-  count             = var.grafana_grant_all_users_role != "" ? 1 : 0
-  identity_store_id = tolist(data.aws_ssoadmin_instances.this[0].identity_store_ids)[0]
+  count             = local._sso_identity_store_id != null ? 1 : 0
+  provider          = aws.identity_center
+  identity_store_id = local._sso_identity_store_id
 }
 
 # Grant every Identity Center user the configured role. user_ids is a
 # flat list; AMG handles association creation/removal in-place when the
 # set changes between applies.
 resource "aws_grafana_role_association" "all_users" {
-  count = var.grafana_grant_all_users_role != "" ? 1 : 0
+  count = local._sso_identity_store_id != null ? 1 : 0
 
   role         = var.grafana_grant_all_users_role
   user_ids     = [for u in data.aws_identitystore_users.all[0].users : u.user_id]

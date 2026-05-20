@@ -62,20 +62,24 @@ and deletes it immediately.
 ## Prerequisites
 
 - An AWS account with **Anthropic Claude Opus 4.6 enabled in Bedrock**
-  via the AWS Console (Bedrock → Model access) **in every region the
-  cross-region inference profile fans out to: `us-east-1`, `us-east-2`,
-  AND `us-west-2`**. Model access is opt-in per region; enabling it only
-  in `us-west-2` (the runtime's home region) is NOT enough — invocations
-  will land on any of those three regions and fail with
-  `AccessDeniedException ... aws-marketplace:Subscribe` for whichever
-  region is still un-subscribed. The runtime role does NOT have
-  marketplace permissions on purpose (over-broad); the model must be
-  pre-subscribed by a human admin.
-- **AWS IAM Identity Center enabled** in the account in `us-west-2`.
-  Amazon Managed Grafana requires it (or SAML) for human login; enabling
-  Identity Center is an organization-level action and is intentionally
-  **out of scope for this Terraform stack**. The agent itself does not
-  use SSO — it authenticates via a Grafana service account.
+  via the AWS Console (Bedrock → Model access) **in all three regions
+  the cross-region inference profile fans out to: `us-east-1`,
+  `us-east-2`, AND `us-west-2`**. Opus 4.6 is inference-profile-only on
+  Bedrock (the bare foundation model rejects on-demand invocation with
+  `ValidationException`), so the agent uses the `us.anthropic.claude-opus-4-6-v1`
+  profile; enabling the model only in your home region (e.g. `us-east-1`)
+  is NOT enough — whichever region the profile routes to must be
+  subscribed too. Invocations to an un-subscribed region fail with
+  `AccessDeniedException ... aws-marketplace:Subscribe`. The runtime
+  role does NOT have marketplace permissions on purpose (over-broad);
+  the model must be pre-subscribed by a human admin.
+- **AWS IAM Identity Center enabled** in the account. Amazon Managed
+  Grafana requires it (or SAML) for human login; enabling Identity
+  Center is an organization-level action and is intentionally **out of
+  scope for this Terraform stack**. Identity Center is account-global
+  (region-agnostic), so it doesn't need to match the deploy region. The
+  agent itself does not use SSO — it authenticates via a Grafana
+  service account.
 - **Terraform `>= 1.9`** (AWS provider `~> 6.18`, plus the
   `grafana/grafana` provider `~> 3.0` used to provision the data source).
 - **Python 3.13** (managed via `.python-version` and `uv`).
@@ -138,7 +142,8 @@ is no `:latest` drift.
 - AWS credentials for the target account exported in your shell
   (`aws sts get-caller-identity` works), with permission to create the
   resources below and `bedrock-agentcore:InvokeAgentRuntime`.
-- Claude Opus 4.6 enabled in Bedrock in `us-west-2`, and IAM Identity
+- Claude Opus 4.6 enabled in Bedrock in `us-east-1` + `us-east-2` +
+  `us-west-2` (see Prerequisites for why all three), and IAM Identity
   Center enabled in the account (see Prerequisites).
 - `uv`, Terraform ≥ 1.9, Docker with buildx, and AWS CLI v2 installed.
   On an x86_64 host, also QEMU binfmt (`docker run --privileged --rm
@@ -182,8 +187,16 @@ the `VIEWER` role on the workspace at apply time (controlled by the
 `grafana_grant_all_users_role` variable — set to `"EDITOR"` if you also
 want everyone to edit dashboards, `"ADMIN"` for full control, or `""` to
 opt out and assign access by hand). For named admin groups, set
-`grafana_admin_group_ids` in `terraform.tfvars` and re-apply. Then open
-the workspace:
+`grafana_admin_group_ids` in `terraform.tfvars` and re-apply.
+
+> Identity Center is account-global but its instance lives in **one
+> specific region** (the one it was originally enabled in). If that
+> region differs from `var.region`, set `identity_center_region` in
+> `terraform.tfvars` to point at the Identity Center home region —
+> otherwise the auto-grant fails with
+> `check "identity_center_present_when_auto_grant_enabled"`.
+
+Then open the workspace:
 
 ```bash
 terraform -chdir=terraform output -raw grafana_workspace_url
@@ -204,7 +217,7 @@ RUNTIME_ARN=$(terraform -chdir=terraform output -raw agent_runtime_arn)
 # per-call id and memory will not span invocations.
 SESSION_ID="cloudwatch-agent-demo-session-000001"
 aws bedrock-agentcore invoke-agent-runtime \
-  --region us-west-2 --agent-runtime-arn "$RUNTIME_ARN" --qualifier DEFAULT \
+  --region us-east-1 --agent-runtime-arn "$RUNTIME_ARN" --qualifier DEFAULT \
   --runtime-session-id "$SESSION_ID" \
   --payload '{"prompt": "Read the /cloudwatch-agent/demo logs for the last 14 days and create a Grafana dashboard set: an overview plus one dashboard per service."}' \
   /tmp/agent.json && cat /tmp/agent.json
@@ -252,7 +265,7 @@ payload is JSON with a `prompt` field and an optional `userId`:
 
 ```bash
 aws bedrock-agentcore invoke-agent-runtime \
-  --region us-west-2 \
+  --region us-east-1 \
   --agent-runtime-arn "$(terraform -chdir=terraform output -raw agent_runtime_arn)" \
   --qualifier DEFAULT \
   --runtime-session-id "cloudwatch-agent-demo-session-000001" \
@@ -324,7 +337,7 @@ tries to delete the CloudWatch data source. Recreate the token first
 then `destroy`.
 
 Delete the demo log group separately (Terraform does not manage it):
-`aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-west-2`.
+`aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-east-1`.
 
 This removes the AgentCore Runtime endpoint, the runtime, the memory
 resource, the IAM role, the ECR repository (including all images), and
