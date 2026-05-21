@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
 import time
 import uuid
@@ -51,7 +53,6 @@ from typing import Any
 
 import boto3
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
@@ -64,62 +65,209 @@ err_console = Console(stderr=True, highlight=False)
 
 
 # ---------------------------------------------------------------------------
-# Streaming-markdown renderer
+# Streaming-text renderer
 # ---------------------------------------------------------------------------
 #
 # The agent's assistant text arrives token-by-token over the SSE stream.
-# We accumulate it in a buffer and re-render the buffer as Markdown via
-# rich.Live a few times per second, so the user sees the response
-# appearing live AND formatted (bold, lists, headers, code blocks) —
-# the same UX Claude.ai / ChatGPT have, instead of literal ``**bold**``.
-#
-# The live region is opened lazily on the first text delta and closed
-# whenever a non-text event interrupts the text block (a tool starts,
-# the message ends, the turn metadata arrives, or the stream is
-# cancelled). That guarantees no other ``console.print`` call clashes
-# with the in-place updating Live region.
+# Previous versions wrapped the streaming buffer in ``rich.Live`` with a
+# ``Markdown`` widget so bold/lists/code blocks rendered live. That broke
+# badly on long blocks: once the buffer exceeded the terminal height,
+# rich could no longer repaint in place and each refresh re-printed the
+# entire buffer below the prior render, so a 3 KB response appeared 15+
+# times. Now we stream plain text (no live re-render — impossible to
+# duplicate) and, when the block ends, clear the streamed lines and
+# print the same content once more as proper Markdown.
 
 _md_buffer: str = ""
-_md_live: Live | None = None
+# Number of physical terminal rows we have written for the current
+# in-progress text block — used to ``\033[<n>F`` back up and erase the
+# plain-text stream before the rendered Markdown takes its place.
+_md_rows_printed: int = 0
+
+# Export collector. Every assistant text block closed via ``_md_close``
+# is appended here (in order) so ``--export`` can serialize the cleaned
+# conversation alongside the raw SSE dump. Reset at the start of each
+# turn by ``_invoke_once``.
+_turn_text_blocks: list[str] = []
+# Tool names invoked during the current turn, in call order. Populated
+# from contentBlockStart events.
+_turn_tool_calls: list[str] = []
+
+
+def _terminal_width() -> int:
+    # Falls back to a reasonable default if stdout is not a TTY.
+    return console.size.width or 80
+
+
+def _physical_rows(text: str) -> int:
+    """How many terminal rows a chunk of text will occupy when printed.
+
+    Counts wrapped lines using the current terminal width. Tabs and
+    other control chars are not handled precisely; close enough for
+    the cursor-up cleanup, which only needs to overestimate to be
+    safe.
+    """
+    width = _terminal_width()
+    rows = 0
+    for line in text.split("\n"):
+        # Empty lines still occupy a row.
+        rows += max(1, (len(line) + width - 1) // width)
+    return rows
 
 
 def _md_open() -> None:
-    global _md_live, _md_buffer
-    if _md_live is not None:
-        return
+    global _md_buffer, _md_rows_printed
     _md_buffer = ""
-    _md_live = Live(
-        Markdown(""),
-        console=console,
-        refresh_per_second=12,
-        vertical_overflow="visible",
-        transient=False,
-    )
-    _md_live.start()
+    _md_rows_printed = 0
 
 
 def _md_append(text: str) -> None:
-    global _md_buffer
-    if _md_live is None:
+    global _md_buffer, _md_rows_printed
+    if not text:
+        return
+    if _md_buffer == "" and _md_rows_printed == 0:
         _md_open()
     _md_buffer += text
-    # ``code_theme`` could be customized; the default monokai-style
-    # works great on dark terminals. justify="left" prevents rich from
-    # centering short final lines.
-    _md_live.update(Markdown(_md_buffer, code_theme="monokai", justify="left"))
+    _md_rows_printed += _physical_rows(text)
+    # ``end=""`` + ``soft_wrap=True`` keeps rich from injecting its own
+    # newlines: we want the raw token stream to land verbatim so our
+    # row counter stays accurate.
+    console.print(text, end="", soft_wrap=True, markup=False, highlight=False)
 
 
 def _md_close() -> None:
-    global _md_live, _md_buffer
-    if _md_live is None:
+    """Replace the streamed plain text with its rendered Markdown form.
+
+    If nothing was streamed since the last close, this is a no-op.
+    Otherwise we move the cursor up over the rows we wrote, clear from
+    there to the end of the screen, and re-print the buffer once as
+    Markdown.
+    """
+    global _md_buffer, _md_rows_printed
+    if not _md_buffer:
+        _md_rows_printed = 0
         return
-    _md_live.stop()
-    _md_live = None
+    # Snapshot the completed block for --export before we tear the
+    # buffer down. Keeping every block as its own entry preserves the
+    # tool-call boundaries (one block per model round).
+    _turn_text_blocks.append(_md_buffer)
+    # Move cursor up over the streamed rows and clear to end of screen.
+    # \033[<n>F = cursor up <n> lines, column 0. \033[J = clear to end.
+    # Guard n>=1 because \033[0F is undefined on some terminals.
+    n = max(1, _md_rows_printed)
+    sys.stdout.write(f"\r\033[{n}F\033[J")
+    sys.stdout.flush()
+    console.print(Markdown(_md_buffer, code_theme="monokai", justify="left"))
     _md_buffer = ""
+    _md_rows_printed = 0
 
 # ---------------------------------------------------------------------------
 # Discovery + helpers
 # ---------------------------------------------------------------------------
+
+def _load_dotenv(path: str = ".env") -> dict[str, str]:
+    """Parse a simple KEY=VALUE .env file. Quotes are stripped."""
+    env: dict[str, str] = {}
+    p = Path(path)
+    if not p.exists():
+        return env
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def _tf_output(tf_dir: str) -> dict[str, Any]:
+    """Run ``terraform output -json`` in ``tf_dir`` and return the parsed
+    mapping, or ``{}`` if the directory does not exist, the binary is
+    missing, or the command fails. Errors are surfaced as dim warnings,
+    never raised — the caller will fall through to the next strategy.
+    """
+    tf_path = Path(tf_dir).expanduser().resolve()
+    if not tf_path.is_dir():
+        return {}
+    try:
+        result = subprocess.run(
+            ["terraform", "output", "-json"],
+            cwd=str(tf_path),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        err_console.print(f"[dim yellow]terraform output skipped: {exc}[/]")
+        return {}
+    if result.returncode != 0:
+        err_console.print(
+            f"[dim yellow]terraform output failed: "
+            f"{result.stderr.strip()[:200]}[/]"
+        )
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        err_console.print(f"[dim yellow]terraform output not JSON: {exc}[/]")
+        return {}
+
+
+def _arn_from_terraform(tf_dir: str) -> str | None:
+    """Look up the runtime ARN in ``terraform output``.
+
+    Accepts any of a few common output key names so the script works
+    whether the user named their output ``agent_runtime_arn``,
+    ``runtime_arn``, or ``agentcore_runtime_arn``.
+    """
+    tf = _tf_output(tf_dir)
+    for key in ("agent_runtime_arn", "runtime_arn", "agentcore_runtime_arn"):
+        obj = tf.get(key)
+        if not obj:
+            continue
+        value = obj.get("value") if isinstance(obj, dict) else obj
+        if value:
+            return str(value)
+    return None
+
+
+def _resolve_runtime_arn(
+    region: str, runtime_name_prefix: str, tf_dir: str
+) -> str:
+    """Resolve the runtime ARN by trying every strategy in order.
+
+    The chain is:
+      1. ``AGENT_RUNTIME_ARN`` in the environment.
+      2. ``AGENT_RUNTIME_ARN`` in a ``.env`` file in CWD.
+      3. ``terraform output`` in ``tf_dir`` (accepts a few key names).
+      4. ``bedrock-agentcore-control:ListAgentRuntimes`` filtered by
+         ``runtime_name_prefix`` (the original behavior).
+
+    The first hit wins and is annotated in stderr so the user can see
+    where the ARN came from. The function ``sys.exit``s with a clear
+    error if everything fails — the caller never has to ``None``-check.
+    """
+    arn = os.environ.get("AGENT_RUNTIME_ARN", "").strip()
+    if arn:
+        err_console.print("[dim]ARN from env var[/]")
+        return arn
+
+    arn = _load_dotenv(".env").get("AGENT_RUNTIME_ARN", "").strip()
+    if arn:
+        err_console.print("[dim]ARN from .env[/]")
+        return arn
+
+    arn = _arn_from_terraform(tf_dir)
+    if arn:
+        err_console.print(f"[dim]ARN from terraform output ({tf_dir})[/]")
+        return arn
+
+    # Final fallback: discover by name prefix via the control plane.
+    err_console.print(
+        f"[dim]ARN via list-agent-runtimes (prefix='{runtime_name_prefix}')[/]"
+    )
+    return _find_runtime_arn(region, runtime_name_prefix)
+
 
 def _find_runtime_arn(region: str, runtime_name_prefix: str) -> str:
     """List AgentCore runtimes and return the ARN matching a name prefix.
@@ -189,10 +337,10 @@ def _render_event(payload: Any) -> None:
       tool results once a tool call returns.
     * Control signals like ``init_event_loop`` — skipped.
 
-    Text deltas accumulate in the streaming-markdown buffer (rendered
-    via rich.Live above). Any other event closes the live region first
-    so its own ``console.print`` call doesn't clash with the
-    in-place-updating Markdown.
+    Text deltas accumulate in the streaming-text buffer (printed as
+    plain text token-by-token, see _md_append above). Any other event
+    closes the buffer first so the streamed plain text is replaced
+    with its rendered Markdown form before the next event prints.
     """
     if not isinstance(payload, dict):
         return
@@ -208,12 +356,12 @@ def _render_event(payload: Any) -> None:
             _md_close()  # any preceding text block ends before this tool starts
             tu = ev["contentBlockStart"].get("start", {}).get("toolUse", {})
             if tu:
-                console.print(
-                    f"  [yellow]⚡[/] [bold cyan]{tu.get('name', '?')}[/]"
-                )
+                name = tu.get("name", "?")
+                _turn_tool_calls.append(name)
+                console.print(f"  [yellow]⚡[/] [bold cyan]{name}[/]")
             return
 
-        # Incremental deltas. Text deltas feed the live-markdown stream;
+        # Incremental deltas. Text deltas feed the streaming-text buffer;
         # tool-input deltas are ignored (rendering the model assembling
         # tool args adds noise without value).
         if "contentBlockDelta" in ev:
@@ -298,13 +446,20 @@ def _invoke_once(
     prompt: str,
     output_path: str,
     raw: bool,
-) -> int:
+) -> dict[str, Any]:
     """Send one prompt, stream the response, write the raw SSE to a file.
 
-    Returns the byte count streamed. On streaming errors (incl. user
-    Ctrl-C mid-stream) the partial stream is still flushed and the
-    function returns the bytes received so far rather than raising.
+    Returns a dict with the byte count, elapsed time, the cleaned
+    assistant text blocks (in model-round order), and the tool-call
+    names captured during the turn. Used by ``--export`` to assemble a
+    session bundle. On streaming errors (incl. user Ctrl-C mid-stream)
+    the partial stream is still flushed and the partial result is
+    returned rather than raising.
     """
+    global _turn_text_blocks, _turn_tool_calls
+    _turn_text_blocks = []
+    _turn_tool_calls = []
+
     t0 = time.time()
     try:
         response = client.invoke_agent_runtime(
@@ -319,7 +474,15 @@ def _invoke_once(
             f"[red]invoke_agent_runtime failed: "
             f"{type(exc).__name__}: {exc}[/]"
         )
-        return 0
+        return {
+            "prompt": prompt,
+            "bytes": 0,
+            "elapsed_s": 0.0,
+            "assistant_blocks": [],
+            "tool_calls": [],
+            "raw_path": output_path,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
     body = response["response"]
     total = 0
@@ -341,16 +504,16 @@ def _invoke_once(
                     _print_block(block)
         except KeyboardInterrupt:
             interrupted = True
-            _md_close()  # don't leave the Live region dangling
+            _md_close()  # flush the partial text block before exiting
             err_console.print(
                 "\n[yellow]⚠ stream interrupted by Ctrl-C[/]"
             )
         # Flush any tail event that didn't end with a blank line.
         if not raw and buffer.strip():
             _print_block(buffer)
-        # Final safety net: close the markdown stream if it's still
-        # open (e.g. the response ended without an explicit
-        # contentBlockStop event for the text block).
+        # Final safety net: flush any in-flight text block if the
+        # response ended without an explicit contentBlockStop event
+        # for the last text block.
         _md_close()
 
     elapsed = time.time() - t0
@@ -359,7 +522,51 @@ def _invoke_once(
         f"[dim]──  {total:,} bytes   ·   {elapsed:.1f}s   ·   "
         f"raw → {output_path}[/]{suffix}"
     )
-    return total
+    return {
+        "prompt": prompt,
+        "bytes": total,
+        "elapsed_s": round(elapsed, 3),
+        "assistant_blocks": list(_turn_text_blocks),
+        "tool_calls": list(_turn_tool_calls),
+        "raw_path": output_path,
+        "interrupted": interrupted,
+    }
+
+
+def _write_export_bundle(
+    export_dir: str,
+    session_id: str,
+    user_id: str,
+    region: str,
+    arn: str,
+    turns: list[dict[str, Any]],
+    label: str,
+) -> Path:
+    """Serialize a session bundle to ``<export_dir>/<label>-<sid>-<ts>.json``.
+
+    The bundle is meant to be human-readable and grep-friendly: prompt,
+    cleaned assistant text per round, tool-call sequence, byte counts,
+    and pointers back to the raw SSE dumps. The directory is created on
+    demand so ``--export`` works with a fresh repo. Returns the path
+    written.
+    """
+    out_dir = Path(export_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = out_dir / f"{label}-{session_id[:8]}-{ts}.json"
+    bundle = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "region": region,
+        "runtime_arn": arn,
+        "exported_at": ts,
+        "turns": turns,
+    }
+    path.write_text(
+        json.dumps(bundle, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _per_turn_output(template: str, turn: int) -> str:
@@ -420,9 +627,10 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
     """Multi-turn REPL: prompt -> invoke -> stream -> repeat.
 
     Memory continuity comes for free because every turn uses the same
-    ``session_id``. ``:new`` rotates it. Ctrl-D exits; Ctrl-C cancels
-    the current input (or the current in-flight stream) without
-    exiting the REPL.
+    ``session_id``. ``:new`` rotates it (and flushes any pending
+    ``--export`` bundle for the previous session). Ctrl-D exits;
+    Ctrl-C cancels the current input (or the current in-flight stream)
+    without exiting the REPL.
     """
     # readline gives input() history + arrow-key editing for free.
     try:
@@ -437,10 +645,31 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
     err_console.print(_banner_panel(arn, session_id, args.user_id, raw))
 
     turn = 0
+    collected_turns: list[dict[str, Any]] = []
+
+    def _flush_export(reason: str) -> None:
+        # Local closure so :new and final exit share the same logic.
+        if not args.export or not collected_turns:
+            return
+        path = _write_export_bundle(
+            export_dir=args.export_dir,
+            session_id=session_id,
+            user_id=args.user_id,
+            region=args.region,
+            arn=arn,
+            turns=collected_turns,
+            label="repl",
+        )
+        err_console.print(
+            f"[green]✓[/] [dim]exported {len(collected_turns)} turn(s) "
+            f"→[/] [cyan]{path}[/] [dim]({reason})[/]"
+        )
+
     while True:
         try:
             line = console.input("\n[bold magenta]▸[/] ").strip()
         except EOFError:
+            _flush_export("Ctrl-D")
             err_console.print("\n[dim cyan]bye 👋[/]")
             return 0
         except KeyboardInterrupt:
@@ -452,6 +681,7 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
 
         # --- Special commands -----------------------------------------
         if line in (":exit", ":quit", "exit", "quit"):
+            _flush_export(":exit")
             err_console.print("[dim cyan]bye 👋[/]")
             return 0
         if line == ":help":
@@ -466,8 +696,10 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
             )
             continue
         if line == ":new":
+            _flush_export(":new")
             session_id = _fresh_session_id()
             turn = 0
+            collected_turns = []
             err_console.print(
                 f"[bold green]✓[/] [dim]new session →[/] [cyan]{session_id}[/]"
             )
@@ -491,7 +723,7 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
         # --- Regular prompt -------------------------------------------
         turn += 1
         out_path = _per_turn_output(args.output, turn)
-        _invoke_once(
+        result = _invoke_once(
             client=client,
             arn=arn,
             session_id=session_id,
@@ -500,6 +732,8 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
             output_path=out_path,
             raw=raw,
         )
+        if args.export:
+            collected_turns.append(result)
 
 
 def main() -> int:
@@ -557,6 +791,29 @@ def main() -> int:
         action="store_true",
         help="Stream every event verbatim instead of the summarized view.",
     )
+    parser.add_argument(
+        "--tf-dir",
+        default="terraform",
+        help=(
+            "Terraform directory to read ``agent_runtime_arn`` from when "
+            "the ARN is not in the environment or a .env file "
+            "(default: terraform)."
+        ),
+    )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help=(
+            "Write a JSON session bundle (prompt + cleaned assistant text "
+            "+ tool calls per turn) on exit. In REPL mode the bundle is "
+            "also flushed on ``:new`` so each session is preserved."
+        ),
+    )
+    parser.add_argument(
+        "--export-dir",
+        default="./exports",
+        help="Directory for ``--export`` bundles (default: ./exports).",
+    )
     args = parser.parse_args()
 
     session_id = args.session_id or _fresh_session_id()
@@ -565,7 +822,11 @@ def main() -> int:
             f"--session-id must be at least 33 chars (got {len(session_id)})"
         )
 
-    arn = _find_runtime_arn(args.region, args.runtime_name)
+    arn = _resolve_runtime_arn(
+        region=args.region,
+        runtime_name_prefix=args.runtime_name,
+        tf_dir=args.tf_dir,
+    )
 
     # --- Mode selection -----------------------------------------------
     # 1. positional prompt OR piped stdin  -> one-shot
@@ -603,7 +864,7 @@ def main() -> int:
         )
         err_console.print()
         client = boto3.client("bedrock-agentcore", region_name=args.region)
-        _invoke_once(
+        result = _invoke_once(
             client=client,
             arn=arn,
             session_id=session_id,
@@ -612,6 +873,19 @@ def main() -> int:
             output_path=args.output,
             raw=args.raw,
         )
+        if args.export:
+            path = _write_export_bundle(
+                export_dir=args.export_dir,
+                session_id=session_id,
+                user_id=args.user_id,
+                region=args.region,
+                arn=arn,
+                turns=[result],
+                label="oneshot",
+            )
+            err_console.print(
+                f"[green]✓[/] [dim]exported turn →[/] [cyan]{path}[/]"
+            )
         return 0
 
     return _interactive_repl(args, arn, session_id)

@@ -24,6 +24,7 @@ import atexit
 import logging
 import sys
 import uuid
+from datetime import UTC, datetime
 
 import boto3
 from mcp import StdioServerParameters
@@ -116,29 +117,43 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
 
     grafana_ctl = boto3.client("grafana", region_name=REGION)
 
-    # Best-effort cleanup of orphan tokens carrying our prefix. If the
-    # IAM role lacks ListWorkspaceServiceAccountTokens we just log
-    # and continue.
+    # Best-effort cleanup: only delete tokens that are ALREADY EXPIRED.
+    # Earlier versions deleted every token sharing our prefix, which
+    # raced with sibling containers: a cold-starting container would
+    # nuke a still-valid token held by another container, and that
+    # container would then 401 on the next dashboard update. Expired
+    # tokens are guaranteed dead, so deleting them is safe and still
+    # frees the per-SA quota slot (AMG caps at ~10 tokens per SA). If
+    # the IAM role lacks ListWorkspaceServiceAccountTokens we log and
+    # move on.
     try:
         leftover = grafana_ctl.list_workspace_service_account_tokens(
             workspaceId=GRAFANA_WORKSPACE_ID,
             serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
         ).get("serviceAccountTokens", [])
+        now = datetime.now(UTC)
         for tok in leftover:
-            if tok.get("name", "").startswith(_AGENT_TOKEN_NAME_PREFIX):
-                try:
-                    grafana_ctl.delete_workspace_service_account_token(
-                        workspaceId=GRAFANA_WORKSPACE_ID,
-                        serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
-                        tokenId=tok["id"],
-                    )
-                    logger.info("Cleaned leftover Grafana token: %s", tok["id"])
-                except Exception as del_exc:  # noqa: BLE001
-                    logger.debug(
-                        "Could not delete leftover token %s: %s",
-                        tok.get("id"),
-                        del_exc,
-                    )
+            if not tok.get("name", "").startswith(_AGENT_TOKEN_NAME_PREFIX):
+                continue
+            expires_at = tok.get("expiresAt")
+            # Skip anything still valid: it may belong to a sibling
+            # container that is currently serving traffic. Missing
+            # expiresAt is treated as "still valid" out of caution.
+            if expires_at is None or expires_at > now:
+                continue
+            try:
+                grafana_ctl.delete_workspace_service_account_token(
+                    workspaceId=GRAFANA_WORKSPACE_ID,
+                    serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
+                    tokenId=tok["id"],
+                )
+                logger.info("Cleaned expired Grafana token: %s", tok["id"])
+            except Exception as del_exc:  # noqa: BLE001
+                logger.debug(
+                    "Could not delete expired token %s: %s",
+                    tok.get("id"),
+                    del_exc,
+                )
     except Exception as list_exc:  # noqa: BLE001
         logger.warning(
             "Could not list existing Grafana tokens (continuing): %s",

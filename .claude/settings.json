@@ -35,7 +35,17 @@
       "Bash(python3 -m py_compile invoke.py)",
       "Bash(.venv/bin/python invoke.py --help)",
       "Bash(.venv/bin/python -c \"import rich; print\\('rich', rich.__version__\\)\")",
-      "Bash(.venv/bin/python -c \"from rich.console import Console; from rich.panel import Panel; from rich.rule import Rule; from rich.text import Text; print\\('imports OK'\\)\")"
+      "Bash(.venv/bin/python -c \"from rich.console import Console; from rich.panel import Panel; from rich.rule import Rule; from rich.text import Text; print\\('imports OK'\\)\")",
+      "Bash(aws bedrock-agentcore-control *)",
+      "Bash(aws grafana *)",
+      "Bash(ls /tmp/agent-turn-*.json 2>/dev/null | head -5)",
+      "Read(//private/tmp/**)",
+      "Bash(grep -oE '\"toolUse\"[^}]{0,200}' /tmp/agent-turn-3.json)",
+      "Bash(grep -oE '\"toolUse\"[^}]{0,200}' /tmp/agent-turn-2.json)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('invoke.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('invoke.py'\\).read\\(\\)\\); print\\('parse ok'\\)\")",
+      "Bash(python3 invoke.py --help)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('seeds/week3.py'\\).read\\(\\)\\); print\\('parse ok'\\)\")"
     ]
   }
 }
