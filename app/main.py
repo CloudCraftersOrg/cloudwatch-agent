@@ -1,19 +1,19 @@
 """Entrypoint for the CloudWatch Agent.
 
-This module wires together:
+Connects three pieces:
 
-- The AgentCore Runtime HTTP server (``BedrockAgentCoreApp``).
-- The Strands ``Agent`` (LLM reasoning loop + tool dispatch).
-- AgentCore Memory (short-term session memory + long-term user memory),
-  attached only when ``MEMORY_ID`` is configured.
+- The AgentCore Runtime HTTP server (``BedrockAgentCoreApp``), which
+  exposes ``POST /invocations``.
+- The Strands ``Agent``, which runs the reasoning loop and dispatches
+  tools.
+- AgentCore Memory, wired in via a session manager when ``MEMORY_ID``
+  is set (always set in production; in local dev it can be omitted,
+  in which case the agent degrades to in-process state).
 
-The decorated ``invoke`` function is the single HTTP handler exposed at
-``POST /invocations`` by AgentCore Runtime. Module-level state (e.g. the
-boto3 clients in ``app/tools``) lives for the life of the container and
-may serve multiple invocations of the same session, possibly
-concurrently; it is never shared across different sessions' containers.
-A fresh Strands ``Agent`` is built per invocation (see ``invoke``); the
-boto3 clients are reused because they are thread-safe for our read APIs.
+The runtime may serve several invocations of the same session on the
+same container; module-level state (boto3 clients in ``app/tools``)
+is reused across invocations. A fresh ``Agent`` is constructed per
+invocation because Strands keeps history per instance.
 """
 
 from __future__ import annotations
@@ -33,43 +33,24 @@ from app.config import MEMORY_ID, MODEL_ID, REGION
 from app.prompts import SYSTEM_PROMPT
 from app.tools import TOOLS
 
-# AgentCore Runtime expects a top-level ``app`` object that exposes an
-# ASGI-compatible callable on port 8080. ``BedrockAgentCoreApp`` builds
-# that for us and also registers the standard health-check and invocation
-# endpoints required by the Runtime contract.
+# AgentCore Runtime expects a top-level ``app`` ASGI object listening
+# on port 8080. BedrockAgentCoreApp registers the health-check and
+# invocation endpoints the contract requires.
 app = BedrockAgentCoreApp()
 
 
 def _build_session_manager(
     session_id: str, user_id: str
 ) -> AgentCoreMemorySessionManager | None:
-    """Construct the AgentCore Memory session manager, or ``None`` in dev.
+    """Build the AgentCore Memory session manager.
 
-    Production deployments always have ``MEMORY_ID`` set by Terraform.
-    Local development typically does not, so we let the agent run without
-    memory persistence rather than forcing contributors to provision an
-    AgentCore Memory resource just to iterate on prompts.
-
-    Args:
-        session_id: AgentCore-supplied session identifier; used so that
-            conversational history is preserved across multiple
-            invocations within the same session.
-        user_id: Caller-supplied principal identifier; used as the
-            "actor" key for long-term memory (per-user preferences and
-            facts).
-
-    Returns:
-        A configured session manager, or ``None`` if ``MEMORY_ID`` is
-        unset (in which case Strands will keep state in-process for the
-        duration of the invocation only).
+    Returns ``None`` when ``MEMORY_ID`` is empty (local dev without a
+    provisioned memory resource), so the agent still starts and
+    Strands keeps in-process state for the invocation.
     """
     if not MEMORY_ID:
         return None
 
-    # The session manager bridges Strands' conversation history with
-    # AgentCore Memory. Short-term history is automatically persisted to
-    # the session; long-term strategies (summarization, user preference,
-    # semantic facts) are evaluated asynchronously by AgentCore.
     return AgentCoreMemorySessionManager(
         agentcore_memory_config=AgentCoreMemoryConfig(
             memory_id=MEMORY_ID,
@@ -82,41 +63,32 @@ def _build_session_manager(
 
 @app.entrypoint
 async def invoke(payload, context):
-    """Handle a single agent invocation.
+    """Handle a single invocation.
 
-    Args:
-        payload: JSON body sent by the caller. We expect at minimum a
-            ``prompt`` field; ``userId`` is optional and defaults to
-            ``"anonymous"`` for unauthenticated callers.
-        context: Runtime-provided context object. We use
-            ``context.session_id`` as the AgentCore Memory session
-            identifier so that conversational state is preserved across
-            invocations of the same session.
+    Expects ``prompt`` in the payload (required) and an optional
+    ``userId`` (default ``"anonymous"``). ``context.session_id`` is
+    provided by AgentCore Runtime and used as the session key for
+    memory.
 
-    Yields:
-        Streaming events from the Strands ``Agent`` (tokens, tool calls,
-        tool results). AgentCore Runtime forwards these to the client as
-        Server-Sent Events.
+    Yields streaming events (tokens, tool calls, tool results) that
+    AgentCore forwards to the client as Server-Sent Events.
     """
     user_message = payload.get("prompt", "")
     user_id = payload.get("userId", "anonymous")
 
-    # ``context.session_id`` is Optional[str] and is None whenever the
-    # caller invokes the runtime without a runtimeSessionId. AgentCore
-    # Memory's config requires a non-empty session id (it raises a
-    # pydantic ValidationError on None/""), so fall back to a generated
-    # id rather than 500ing. The fallback is per-invocation, so memory
-    # simply won't span calls when no session id is supplied — graceful
-    # degradation, not a hard failure (mirrors the userId default above).
+    # context.session_id is Optional[str]. AgentCoreMemoryConfig
+    # requires a non-empty string (pydantic ValidationError otherwise),
+    # so we generate a fallback when the caller invokes without
+    # runtimeSessionId. The fallback is per-invocation: no memory
+    # between calls, but the agent does not fail.
     session_id = context.session_id or f"auto-{uuid.uuid4().hex}"
 
     session_manager = _build_session_manager(session_id=session_id, user_id=user_id)
 
-    # Construct a fresh Agent per invocation. Strands ``Agent`` instances
-    # carry per-conversation state (history, tool-call cursors), so a new
-    # instance is built for every invocation. ``region_name`` is pinned so
-    # model calls always target the same region as the tool clients
-    # (app/config.py), even if AWS_REGION is overridden.
+    # New Agent per invocation (Strands keeps history per instance).
+    # Explicit region_name on BedrockModel so model calls always land
+    # in the same region as the tools' boto3 clients, even if
+    # AWS_REGION is changed.
     agent = Agent(
         model=BedrockModel(model_id=MODEL_ID, region_name=REGION),
         system_prompt=SYSTEM_PROMPT,
@@ -124,23 +96,15 @@ async def invoke(payload, context):
         session_manager=session_manager,
     )
 
-    # Stream events back to the client so the user sees incremental
-    # progress (especially useful for long tool-using turns).
-    #
-    # Filter out Strands' internal diagnostic events. ``stream_async``
-    # yields two classes of events:
-    #   - JSON-serializable dicts (the Bedrock Converse stream events
-    #     the client consumes — content deltas, tool use deltas, message
-    #     snapshots, control signals).
-    #   - Diagnostic dicts that embed live Python objects
-    #     (``Agent``, ``Trace``, ``NonRecordingSpan``, ``AgentResult``).
-    #     When AgentCore serializes the latter, json.dumps fails and the
-    #     runtime falls back to ``str(dict)`` — emitting Python ``repr``
-    #     blobs per event. A single short conversation produces ~30 MB
-    #     of SSE that way, which crashes browser SSE readers with
-    #     "Error processing response: network error".
-    # Try-json.dumps drops the bad ones; the cost is negligible (~µs per
-    # event, few thousand events per invoke).
+    # Event filter. stream_async emits two classes of items:
+    # (a) JSON-serializable dicts (the Bedrock Converse stream events
+    #     that the client consumes).
+    # (b) diagnostic dicts with live Python objects (Agent, Trace,
+    #     etc). When AgentCore tries to serialize these, json.dumps
+    #     fails and it falls back to str(dict), inflating the SSE
+    #     stream with megabytes of repr output and breaking browser
+    #     readers.
+    # The try/json.dumps drops the (b) items; cost is ~µs per event.
     async for event in agent.stream_async(user_message):
         if not isinstance(event, dict):
             continue
@@ -152,7 +116,7 @@ async def invoke(payload, context):
 
 
 if __name__ == "__main__":
-    # Local development entrypoint. ``app.run()`` starts the same HTTP
-    # server that AgentCore Runtime will start in production, so the
-    # local dev loop is identical to the deployed behavior.
+    # Entry point for local dev. app.run() spins up the same HTTP
+    # server AgentCore Runtime spins up in production, so the dev loop
+    # mirrors the deployed behavior exactly.
     app.run()

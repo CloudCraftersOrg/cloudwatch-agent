@@ -1,23 +1,11 @@
+# Execution role assumed by Bedrock AgentCore Runtime when invoking
+# the agent, and reused as the memory execution role by AgentCore
+# Memory for strategy extraction and consolidation.
 
-# #############################################################################
-# IAM role for AgentCore Runtime
-#
-# Purpose: Grants the AgentCore Runtime the minimum permissions required to invoke the agent.
-# The role is split into two halves:
-#   1. Trust policy: who can assume the role (AgentCore Runtime service principal, scoped to this account/region).
-#   2. Inline permissions policy: what the agent can do at runtime (see annotated statements below).
-# #############################################################################
-
-# #############################################################################
-# Trust policy: Only the AgentCore Runtime service may assume this role, and
-# only on behalf of a bedrock-agentcore resource in this account/region. This
-# role doubles as the AgentCore Memory execution role (see memory.tf), so the
-# SourceArn allowlist must include BOTH the runtime/* context (normal agent
-# invocation) and the memory/* context (strategy extraction/consolidation).
-# Without the memory/* entry the memory service cannot assume this role and
-# all long-term/summary strategies silently fail. aws:SourceAccount +
-# aws:SourceArn still block confused-deputy attacks.
-# #############################################################################
+# Trust policy. Only the bedrock-agentcore service can assume this
+# role, and only when acting on behalf of a resource in this
+# account/region. SourceArn allows both runtime/* (agent
+# invocations) and memory/* (AgentCore Memory strategy processing).
 data "aws_iam_policy_document" "runtime_trust" {
   statement {
     effect  = "Allow"
@@ -28,17 +16,12 @@ data "aws_iam_policy_document" "runtime_trust" {
       identifiers = ["bedrock-agentcore.amazonaws.com"]
     }
 
-    # Lock the assume to this AWS account.
     condition {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [local.account_id]
     }
 
-    # Lock the assume to this account/region, for either the runtime
-    # context (agent invocation) or the memory context (AgentCore Memory
-    # strategy processing on this same execution role). Trailing wildcard
-    # matches any runtime / memory resource ID.
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
@@ -50,11 +33,16 @@ data "aws_iam_policy_document" "runtime_trust" {
   }
 }
 
-# #############################################################################
-# Permissions policy: what the agent can do at runtime. Each statement is annotated with its purpose.
-# #############################################################################
+# Runtime permissions. Each statement is scoped to the actual surface
+# the agent needs. If you change models, regions, or tools, revisit
+# the corresponding ARNs.
 data "aws_iam_policy_document" "runtime_permissions" {
-  # Bedrock model invocation. Scoped to the specific Opus 4.6 model and cross-region inference profile prefix.
+
+  # Main model invocation. Claude Opus 4.6 is inference-profile-only
+  # (the API rejects on-demand against the raw foundation model), so
+  # we point at the us.* profile and at the foundation model with a
+  # region wildcard (the profile fans out to us-east-1, us-east-2,
+  # and us-west-2).
   statement {
     sid    = "InvokeBedrockModels"
     effect = "Allow"
@@ -62,14 +50,6 @@ data "aws_iam_policy_document" "runtime_permissions" {
       "bedrock:InvokeModel",
       "bedrock:InvokeModelWithResponseStream",
     ]
-    # Opus 4.6 is inference-profile-only (the bare foundation model
-    # rejects on-demand invocation with ValidationException), so the
-    # agent calls the ``us.`` cross-region inference profile. That
-    # profile fans out to us-east-1 / us-east-2 / us-west-2, so the
-    # cross-region foundation-model wildcard MUST cover any region; the
-    # in-region foundation-model entry is the local leg of the same
-    # routing. ``v1*`` keeps the scope tight to this model family while
-    # being resilient to AWS adding a version suffix later.
     resources = [
       "arn:aws:bedrock:${local.region}::foundation-model/anthropic.claude-opus-4-6-v1*",
       "arn:aws:bedrock:${local.region}:${local.account_id}:inference-profile/us.anthropic.claude-opus-4-6-v1",
@@ -77,13 +57,10 @@ data "aws_iam_policy_document" "runtime_permissions" {
     ]
   }
 
-  # AgentCore Memory strategy extraction/consolidation. This role doubles
-  # as the memory execution role (see memory.tf); AgentCore invokes an
-  # AWS-managed Anthropic model on its behalf to extract summaries /
-  # preferences / semantic facts. That model is service-chosen and is NOT
-  # the Opus profile the agent itself uses, so the statement above does
-  # not cover it — without this, every strategy silently AccessDenies.
-  # Scoped to the Anthropic foundation-model family (read-only InvokeModel).
+  # Model AgentCore Memory uses internally for its strategies
+  # (summarization, user_preference, semantic_facts). It is a
+  # service-managed model, not the Opus above, so we allow the full
+  # Anthropic family with InvokeModel.
   statement {
     sid     = "InvokeBedrockMemoryStrategyModels"
     effect  = "Allow"
@@ -94,12 +71,10 @@ data "aws_iam_policy_document" "runtime_permissions" {
     ]
   }
 
-  # CloudWatch metrics + alarms, read-only. Used by the AWS Labs
-  # CloudWatch MCP server (get_metric_data, get_metric_metadata,
-  # get_active_alarms, get_alarm_history, get_recommended_metric_alarms)
-  # and any direct metric inspection. Dashboards now live in Grafana, so
-  # no cloudwatch:*Dashboard* permissions are granted. Account-wide
-  # because the underlying APIs do not support resource-level scoping.
+  # CloudWatch metrics and alarms in read-only mode. Used by the AWS
+  # Labs MCP server to answer questions about metrics, anomalies, and
+  # alarms. Scoped to the whole account because these APIs do not
+  # support resource-level permissions.
   statement {
     sid    = "CloudWatchMetricsRead"
     effect = "Allow"
@@ -115,33 +90,23 @@ data "aws_iam_policy_document" "runtime_permissions" {
     resources = ["*"]
   }
 
-  # Grafana token minting. The agent creates a short-lived service-account
-  # token per session to call the Grafana HTTP API, then deletes it. Scoped
-  # to this workspace only; the agent service account itself is created by
-  # Terraform (see grafana.tf) and cannot be created by the agent.
+  # Grafana service-account tokens. The agent mints one when the
+  # container starts, passes it to the Grafana MCP server, and
+  # deletes any orphan tokens from previous containers (Listing).
   statement {
     sid    = "GrafanaServiceAccountTokens"
     effect = "Allow"
     actions = [
       "grafana:CreateWorkspaceServiceAccountToken",
       "grafana:DeleteWorkspaceServiceAccountToken",
-      # Listing lets app/mcp_clients.py purge stale "agent-mcp-*"
-      # tokens at startup so the per-SA quota (~10) doesn't run out
-      # when AgentCore restarts containers without graceful shutdown.
       "grafana:ListWorkspaceServiceAccountTokens",
     ]
     resources = [aws_grafana_workspace.this.arn]
   }
 
-  # CloudWatch Logs read. Covers both paths:
-  #   - filter_log_events tool (custom, FilterLogEvents API — bypasses
-  #     Insights so it has no indexing lag).
-  #   - AWS Labs CloudWatch MCP server (describe_log_groups,
-  #     execute_log_insights_query, analyze_log_group,
-  #     get_logs_anomaly_detectors).
-  # Account-scoped at the IAM layer; the agent decides log groups at
-  # runtime (no resource-level scoping is meaningful for the cross-group
-  # describe/list operations).
+  # CloudWatch Logs in read-only mode. Covers both the custom
+  # filter_log_events tool (direct FilterLogEvents, no indexing lag)
+  # and the Insights queries the CloudWatch MCP triggers.
   statement {
     sid    = "CloudWatchLogsRead"
     effect = "Allow"
@@ -164,7 +129,7 @@ data "aws_iam_policy_document" "runtime_permissions" {
     resources = ["*"]
   }
 
-  # Resource discovery. Read-only descriptors for EC2, RDS, and Lambda. No resource-level scoping for list/describe variants.
+  # Resource discovery in read-only mode.
   statement {
     sid    = "ResourceDiscoveryReadOnly"
     effect = "Allow"
@@ -176,18 +141,10 @@ data "aws_iam_policy_document" "runtime_permissions" {
     resources = ["*"]
   }
 
-  # AgentCore Memory access. Scoped to the specific memory resource and
-  # sub-resources. The action list is exactly what the Strands
-  # AgentCoreMemorySessionManager calls on the data plane:
-  #   - CreateEvent           : persist a conversation turn.
-  #   - GetEvent / ListEvents : restore session history.
-  #   - DeleteEvent           : update_message (events are immutable, so
-  #                             update = create-new + delete-old) and the
-  #                             legacy-session migration path. The earlier
-  #                             policy granted DeleteMemoryRecord instead,
-  #                             which the SDK never calls — so message
-  #                             updates/redaction AccessDenied'd.
-  #   - RetrieveMemoryRecords : long-term (semantic/preference) recall.
+  # AgentCore Memory access. The actions list matches exactly what
+  # the Strands AgentCoreMemorySessionManager calls on the data
+  # plane. DeleteEvent is the right one for update and migration
+  # flows (events are immutable, so update = create + delete).
   statement {
     sid    = "AgentCoreMemoryAccess"
     effect = "Allow"
@@ -204,12 +161,12 @@ data "aws_iam_policy_document" "runtime_permissions" {
     ]
   }
 
-  # ECR pull. AgentCore Runtime pulls the container image from ECR on every cold start. Read access scoped to this repository.
+  # ECR image pull at cold start.
   statement {
     sid       = "EcrAuth"
     effect    = "Allow"
     actions   = ["ecr:GetAuthorizationToken"]
-    resources = ["*"] # GetAuthorizationToken does not support resource scoping.
+    resources = ["*"]
   }
 
   statement {
@@ -218,14 +175,14 @@ data "aws_iam_policy_document" "runtime_permissions" {
     actions = [
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
-      # Part of the standard ECR pull set (AmazonEC2ContainerRegistryReadOnly);
-      # AgentCore's cold-start image pull can fail without it.
       "ecr:BatchCheckLayerAvailability",
     ]
     resources = [aws_ecr_repository.this.arn]
   }
 
-  # CloudWatch Logs writes for the runtime's own log group. Path is well-known but runtime ID is allocated by the service, so scope by prefix wildcard.
+  # Writing the runtime's own log group (container stdout/stderr).
+  # The exact runtime ID is assigned by the service, so the prefix
+  # carries a wildcard.
   statement {
     sid    = "RuntimeLogWriting"
     effect = "Allow"
@@ -240,12 +197,10 @@ data "aws_iam_policy_document" "runtime_permissions" {
     ]
   }
 
-  # Built-in observability export. AGENT_OBSERVABILITY_ENABLED=true plus
-  # the aws-opentelemetry-distro (see Dockerfile / runtime.tf) ship
-  # traces to X-Ray and metrics to CloudWatch via EMF/PutMetricData.
-  # None of these support resource-level scoping, so resources must be
-  # "*"; without this statement OTEL export silently fails (non-fatal,
-  # but the runtime's built-in observability would be a no-op).
+  # Native observability export: traces to X-Ray and metrics via
+  # PutMetricData. The runtime has AGENT_OBSERVABILITY_ENABLED=true
+  # and aws-opentelemetry-distro installed in the container; without
+  # these permissions the OTEL exporter fails silently.
   statement {
     sid    = "ObservabilityExport"
     effect = "Allow"
@@ -260,17 +215,12 @@ data "aws_iam_policy_document" "runtime_permissions" {
   }
 }
 
-# #############################################################################
-# IAM role resource. Referenced by AgentCore Runtime in runtime.tf.
-# #############################################################################
 resource "aws_iam_role" "runtime" {
   name               = "${var.project_name}-runtime"
   assume_role_policy = data.aws_iam_policy_document.runtime_trust.json
-
-  description = "Execution role assumed by Bedrock AgentCore Runtime when invoking the CloudWatch Agent."
+  description        = "Execution role for the CloudWatch Agent's AgentCore Runtime."
 }
 
-# Inline policy keeps lifecycle management trivial: policy travels with the role, so `terraform destroy` removes both atomically.
 resource "aws_iam_role_policy" "runtime" {
   name   = "${var.project_name}-runtime-permissions"
   role   = aws_iam_role.runtime.id

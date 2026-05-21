@@ -1,29 +1,14 @@
-# #############################################################################
-# Amazon Managed Grafana workspace and Grafana wiring
-#
-# Purpose: Stands up the AMG workspace the agent writes dashboards into,
-# plus the two service accounts involved:
-#   1. A Terraform "provisioner" service account (ADMIN) whose short-lived
-#      token lets the grafana provider create the CloudWatch data source at
-#      apply time.
-#   2. An "agent" service account (EDITOR) the runtime mints per-session
-#      tokens against to create/update dashboards via the Grafana HTTP API.
-# Human login uses AWS IAM Identity Center (SSO); the agent never uses SSO.
-# #############################################################################
+# Amazon Managed Grafana: workspace where the agent publishes
+# dashboards, service accounts (one admin for Terraform, one EDITOR
+# for the agent at runtime), the CloudWatch data source, and human
+# role assignments via IAM Identity Center.
 
-# #############################################################################
-# Workspace IAM role. With CURRENT_ACCOUNT, the AMG CreateWorkspace API
-# requires an explicit workspaceRoleArn (the "SERVICE_MANAGED auto-creates a
-# role for you" path is no longer accepted by the API and now fails with
-# "ValidationException: When the accountAccessType is CURRENT_ACCOUNT a
-# Workspace Role ARN should be provided."), so we provision the role
-# ourselves under CUSTOMER_MANAGED and attach AWS's managed
-# AmazonGrafanaCloudWatchAccess policy. That policy covers both CloudWatch
-# metrics (ListMetrics / GetMetricData) AND Logs Insights (StartQuery /
-# GetQueryResults / DescribeLogGroups / ...), so authType="default" on the
-# CloudWatch data source resolves to this role for every read — matching
-# what SERVICE_MANAGED + data_sources=["CLOUDWATCH"] used to do.
-# #############################################################################
+# Role the workspace assumes to read the CloudWatch data source. With
+# CURRENT_ACCOUNT the API requires an explicit workspaceRoleArn; the
+# auto-created role from SERVICE_MANAGED is no longer an option. We
+# attach the AmazonGrafanaCloudWatchAccess managed policy, which
+# covers what authType="default" needs on the data source (metrics +
+# Logs Insights).
 data "aws_iam_policy_document" "grafana_workspace_trust" {
   statement {
     effect  = "Allow"
@@ -34,17 +19,14 @@ data "aws_iam_policy_document" "grafana_workspace_trust" {
       identifiers = ["grafana.amazonaws.com"]
     }
 
-    # Lock the assume to this account.
     condition {
       test     = "StringEquals"
       variable = "aws:SourceAccount"
       values   = [local.account_id]
     }
 
-    # Lock the assume to any AMG workspace in this account/region.
-    # Wildcard (rather than the workspace ARN) avoids the trust-policy /
-    # workspace circular dependency; aws:SourceAccount already binds it
-    # to our account, so this is still confused-deputy safe.
+    # Workspace wildcard to avoid the trust-policy/workspace cycle.
+    # aws:SourceAccount already restricts to this account.
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
@@ -56,7 +38,7 @@ data "aws_iam_policy_document" "grafana_workspace_trust" {
 resource "aws_iam_role" "grafana_workspace" {
   name               = "${var.project_name}-grafana-workspace"
   assume_role_policy = data.aws_iam_policy_document.grafana_workspace_trust.json
-  description        = "Role the AMG workspace assumes to query its CloudWatch data source (metrics + Logs Insights)."
+  description        = "Role the AMG workspace assumes to read its CloudWatch data source."
 }
 
 resource "aws_iam_role_policy_attachment" "grafana_workspace_cloudwatch" {
@@ -66,12 +48,8 @@ resource "aws_iam_role_policy_attachment" "grafana_workspace_cloudwatch" {
 
 resource "aws_grafana_workspace" "this" {
   name        = replace(var.project_name, "-", "_")
-  description = "Workspace where the CloudWatch Agent publishes generated dashboards."
+  description = "Workspace where the CloudWatch Agent publishes dashboards."
 
-  # CUSTOMER_MANAGED + an explicit role we own (above). CURRENT_ACCOUNT
-  # keeps data access to this account. data_sources is intentionally
-  # omitted: that argument is a SERVICE_MANAGED hint for the role AWS
-  # would create, and is meaningless when we provide the role ourselves.
   account_access_type      = "CURRENT_ACCOUNT"
   permission_type          = "CUSTOMER_MANAGED"
   role_arn                 = aws_iam_role.grafana_workspace.arn
@@ -80,12 +58,15 @@ resource "aws_grafana_workspace" "this" {
   grafana_version = var.grafana_version
 }
 
-# #############################################################################
-# Provisioner service account: used ONLY by the grafana provider during apply.
-# #############################################################################
+# Service account Terraform uses during apply to create the data
+# source via the grafana provider. ADMIN because data source creation
+# requires it. The token lives 30 days (AMG maximum). If more than
+# 30 days pass between applies, run
+# `terraform apply -replace=aws_grafana_workspace_service_account_token.terraform`
+# first to refresh the token.
 resource "aws_grafana_workspace_service_account" "terraform" {
   name         = "terraform-provisioner"
-  grafana_role = "ADMIN" # Needs ADMIN to manage data sources.
+  grafana_role = "ADMIN"
   workspace_id = aws_grafana_workspace.this.id
 }
 
@@ -93,28 +74,20 @@ resource "aws_grafana_workspace_service_account_token" "terraform" {
   name               = "terraform-provisioner-token"
   service_account_id = aws_grafana_workspace_service_account.terraform.service_account_id
   workspace_id       = aws_grafana_workspace.this.id
-
-  # 30 days is the AMG maximum. The token is only needed during `terraform
-  # apply`; if an apply happens >30 days after the last one, taint this
-  # resource so a fresh token is issued before the grafana provider runs.
-  seconds_to_live = 2592000
+  seconds_to_live    = 2592000
 }
 
-# #############################################################################
-# Agent service account: the runtime mints its own short-lived tokens against
-# this account (grafana:CreateWorkspaceServiceAccountToken). EDITOR is enough
-# to create/update dashboards but cannot change workspace settings or users.
-# #############################################################################
+# Agent service account. EDITOR is enough to create and update
+# dashboards. The agent mints its own tokens against this SA when the
+# container starts (see app/mcp_clients.py).
 resource "aws_grafana_workspace_service_account" "agent" {
   name         = "cloudwatch-agent"
   grafana_role = "EDITOR"
   workspace_id = aws_grafana_workspace.this.id
 }
 
-# #############################################################################
-# CloudWatch data source. authType "default" makes Grafana use the workspace's
-# service-managed IAM role via the AWS SDK default chain — no static keys.
-# #############################################################################
+# CloudWatch data source. authType "default" uses the workspace role
+# via the AWS SDK credentials chain, with no static keys.
 resource "grafana_data_source" "cloudwatch" {
   type       = "cloudwatch"
   name       = "CloudWatch"
@@ -126,22 +99,15 @@ resource "grafana_data_source" "cloudwatch" {
   })
 }
 
-# #############################################################################
-# Human access via IAM Identity Center.
+# Human access via IAM Identity Center. AMG does not grant access on
+# SSO login without an explicit role association ("access-denied"
+# otherwise). There are two opt-in mechanisms:
 #
-# AMG does not grant SSO logins access by default — an unassociated user
-# lands on "Login failed [sso.auth.access-denied]". We therefore wire up
-# two complementary role associations, both opt-in:
-#
-#   1. grafana_admin_group_ids: explicit ADMIN access for named groups.
-#      Defaults to []; if set, those Identity Center groups become
-#      workspace ADMINs.
-#
-#   2. grafana_grant_all_users_role: auto-discovers every user in the
-#      account's Identity Center store and grants them this role
-#      (default VIEWER). Set to "" to disable. The data sources below
-#      are only consulted when the variable is non-empty.
-# #############################################################################
+#   1. grafana_admin_group_ids: list of group IDs that receive ADMIN.
+#   2. grafana_grant_all_users_role: discovers EVERY user in the
+#      identity store and grants them the given role (default
+#      VIEWER). Set to "" to turn it off. The per-user admins in
+#      grafana_admin_user_names are excluded so they do not collide.
 resource "aws_grafana_role_association" "admin" {
   count = length(var.grafana_admin_group_ids) > 0 ? 1 : 0
 
@@ -150,21 +116,16 @@ resource "aws_grafana_role_association" "admin" {
   workspace_id = aws_grafana_workspace.this.id
 }
 
-# Identity Center instance lookup. Must run against the region where the
-# Identity Center instance was created (see var.identity_center_region) —
-# from any other region this data source returns an empty list and the
-# downstream resources error with "Invalid index ... empty list".
+# Identity Center instance. aws_ssoadmin_instances and
+# aws_identitystore_users only see the instance from its home region,
+# so we go through the aws.identity_center provider alias (configured
+# in providers.tf with var.identity_center_region).
 data "aws_ssoadmin_instances" "this" {
   count    = var.grafana_grant_all_users_role != "" ? 1 : 0
   provider = aws.identity_center
 }
 
 locals {
-  # First identity_store_id returned by the instance lookup, or null when
-  # Identity Center is not present in identity_center_region. The null
-  # path lets the auto-grant degrade gracefully (no role association) so
-  # the rest of the stack still applies; we surface a clear hint via the
-  # validation block below instead of an opaque "empty list" error.
   _sso_identity_store_id = (
     var.grafana_grant_all_users_role != "" && length(data.aws_ssoadmin_instances.this) > 0
     ? try(tolist(data.aws_ssoadmin_instances.this[0].identity_store_ids)[0], null)
@@ -172,20 +133,19 @@ locals {
   )
 }
 
-# Sanity check: if the user asked for the auto-grant but no Identity
-# Center instance was found in identity_center_region, fail fast with a
-# pointer to the variable instead of letting the apply continue silently.
+# Sanity check with a clear error message when auto-grant is enabled
+# but no Identity Center exists in the configured region.
 check "identity_center_present_when_auto_grant_enabled" {
   assert {
     condition = (
       var.grafana_grant_all_users_role == "" || local._sso_identity_store_id != null
     )
-    error_message = "grafana_grant_all_users_role is set but no IAM Identity Center instance was found in '${coalesce(var.identity_center_region, var.region)}'. Set identity_center_region in terraform.tfvars to the region where Identity Center was enabled, or set grafana_grant_all_users_role = \"\" to disable the auto-grant."
+    error_message = "grafana_grant_all_users_role is enabled but no IAM Identity Center exists in '${coalesce(var.identity_center_region, var.region)}'. Set identity_center_region in terraform.tfvars to the correct region, or set grafana_grant_all_users_role = \"\" to disable auto-grant."
   }
 }
 
-# All users in that identity store. Re-read on every apply, so newly
-# onboarded Identity Center users get access on the next apply.
+# Identity store users, re-read on every apply so newly onboarded
+# users get access on the next apply.
 data "aws_identitystore_users" "all" {
   count             = local._sso_identity_store_id != null ? 1 : 0
   provider          = aws.identity_center
@@ -193,21 +153,17 @@ data "aws_identitystore_users" "all" {
 }
 
 locals {
-  # Per-user admin IDs (resolved by admin_users data source below). May
-  # be empty if grafana_admin_user_names is empty or Identity Center is
-  # absent — the resource that uses it guards with the same condition.
   _admin_user_ids = (
     local._sso_identity_store_id != null
     ? [for u in data.aws_identitystore_user.admin_users : u.user_id]
     : []
   )
 
-  # All-users IDs minus the per-user admins. AMG promotes the higher
-  # role when a user has multiple associations, so admins assigned via
-  # grafana_admin_user_names would be silently demoted FROM the
-  # all_users VIEWER list — which then leaves the VIEWER association
-  # with 0 users and triggers the provider's "empty result" read bug.
-  # Subtracting the admins keeps the two lists disjoint and avoids that.
+  # IDs of all non-admin users (AMG promotes to the highest role when
+  # a user appears in multiple associations; this prevents admins
+  # from appearing in the VIEWER list, which would leave that
+  # association with 0 users and trigger an "empty result" provider
+  # bug).
   _auto_grant_user_ids = (
     local._sso_identity_store_id != null
     ? tolist(setsubtract(
@@ -218,9 +174,6 @@ locals {
   )
 }
 
-# Grant every NON-ADMIN Identity Center user the configured role. The
-# resource is only created when there's at least one user to associate;
-# an empty user_ids list yields the provider's "empty result" read bug.
 resource "aws_grafana_role_association" "all_users" {
   count = (
     var.grafana_grant_all_users_role != "" &&
@@ -233,10 +186,7 @@ resource "aws_grafana_role_association" "all_users" {
   workspace_id = aws_grafana_workspace.this.id
 }
 
-# Resolve each requested admin user_name to its Identity Center user_id.
-# for_each keyed by user_name so removals from the list cleanly destroy
-# the matching lookup. Skipped entirely when no Identity Center instance
-# was found (the local is null) so we don't leave dangling errors.
+# Resolves each user_name in the list to its Identity Center user_id.
 data "aws_identitystore_user" "admin_users" {
   for_each = (
     local._sso_identity_store_id != null
@@ -254,9 +204,6 @@ data "aws_identitystore_user" "admin_users" {
   }
 }
 
-# ADMIN role grant for the per-user admins. Separate from all_users
-# above because AMG resolves the highest role across associations, so
-# the same user can appear in both lists and end up ADMIN.
 resource "aws_grafana_role_association" "admin_users" {
   count = (
     length(var.grafana_admin_user_names) > 0 && local._sso_identity_store_id != null

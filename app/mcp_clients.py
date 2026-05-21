@@ -1,29 +1,21 @@
-"""MCP client wiring for the agent.
+"""Wires MCP servers into the agent.
 
-Spawns two MCP servers at module import time and exposes their tools to
-the Strands ``Agent``:
+Importing this module spawns two MCP subprocesses that live for the
+full lifetime of the container:
 
-  - **CloudWatch MCP** (AWS Labs): Python package
-    ``awslabs.cloudwatch-mcp-server``, started via
-    ``python -u -m awslabs.cloudwatch_mcp_server.server`` so we never
-    depend on the venv's bin/ being on PATH and stdio is unbuffered
-    (FastMCP's handshake response otherwise gets stuck in Python's
-    line-buffered stdout and the MCP client times out).
-  - **Grafana MCP** (Grafana Labs): Go binary ``mcp-grafana`` bundled
-    in the image at /usr/local/bin (built by the Dockerfile's stage 1).
-    It needs a Grafana service-account token — we mint a short-lived
-    EDITOR token via the AWS Grafana control-plane API at startup,
-    pass it as ``GRAFANA_SERVICE_ACCOUNT_TOKEN``, and delete it on
-    container shutdown via ``atexit``.
+- **CloudWatch MCP** (AWS Labs ``awslabs.cloudwatch-mcp-server``): a
+  Python package run as
+  ``python -u -m awslabs.cloudwatch_mcp_server.server``.
 
-Both subprocesses live for the container's lifetime (a single
-``start()`` at import, a single ``stop()`` via ``atexit``), so
-per-invocation tool calls do not pay any subprocess startup cost.
+- **Grafana MCP** (Grafana Labs ``mcp-grafana``): a Go binary baked
+  into the image at ``/usr/local/bin/mcp-grafana``. It needs a
+  service-account token; we mint one via the Amazon Managed Grafana
+  API at startup, pass it to the subprocess as an env var, and let
+  ``atexit`` delete it on shutdown.
 
-If either server fails to launch (binary missing, AWS creds unavailable
-in a local dev shell, etc.) we log a warning and surface an empty tool
-list for that server only — the rest of the agent still works, which
-keeps local iteration unblocked.
+If either fails to start (binary missing, AWS credentials absent,
+etc.) we log a warning and that server's tool list stays empty; the
+rest of the agent keeps working.
 """
 
 from __future__ import annotations
@@ -48,19 +40,15 @@ from app.config import (
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# CloudWatch MCP (AWS Labs)
-# ---------------------------------------------------------------------------
-
-# Spawn via ``python -u -m awslabs.cloudwatch_mcp_server.server`` rather
-# than the ``awslabs.cloudwatch-mcp-server`` console script:
-#   - sys.executable uses the exact same Python interpreter that's
-#     running the agent (no PATH dependency, works identically in local
-#     dev shells, the container CMD, and tests).
-#   - ``-u`` + PYTHONUNBUFFERED=1 force unbuffered stdio. Without them
-#     Python line-buffers stdout, the MCP ``initialize`` response sits
-#     in the subprocess buffer, and Strands times out after 30 s waiting
-#     for a handshake reply that never arrives.
+# CloudWatch MCP
+#
+# We launch with ``python -u -m ...`` instead of the console script:
+# - sys.executable avoids depending on the venv's PATH (works the
+#   same in local dev, container, and tests).
+# - ``-u`` + PYTHONUNBUFFERED=1 force unbuffered stdio. Without this,
+#   Python buffers per line, the MCP handshake response gets trapped
+#   in the subprocess buffer, and Strands times out at 30 seconds
+#   waiting for a response that never comes.
 _cloudwatch_mcp = MCPClient(
     lambda: stdio_client(
         StdioServerParameters(
@@ -84,43 +72,37 @@ try:
     logger.info(
         "CloudWatch MCP server ready (%d tools).", len(CLOUDWATCH_MCP_TOOLS)
     )
-except Exception as exc:  # noqa: BLE001 — degrade gracefully on startup failure
+except Exception as exc:  # noqa: BLE001
     logger.warning(
         "CloudWatch MCP server unavailable; continuing without its tools: %s",
         exc,
     )
 
 
-# ---------------------------------------------------------------------------
-# Grafana MCP (Grafana Labs)
-# ---------------------------------------------------------------------------
+# Grafana MCP
+#
+# The token is minted once at cold start and then frozen into the env
+# of the mcp-grafana subprocess. AgentCore Runtime keeps containers
+# warm between invocations, so the TTL must cover the container's
+# full lifetime; otherwise grafana_update_dashboard starts returning
+# 401 after a few hours while the rest of the agent still looks
+# healthy. 24h is a conservative ceiling (AMG allows up to 30 days)
+# and the per-SA token quota stays under control via the active
+# orphan cleanup that runs at startup below.
+_GRAFANA_TOKEN_TTL_SECONDS = 86400
 
-# Token TTL handed to the Grafana MCP server. Kept short on purpose:
-# AgentCore Runtime kills containers without SIGTERM most of the time,
-# so the atexit cleanup that deletes our token doesn't always fire and
-# tokens leak. AMG caps ~10 active tokens per service account, so a
-# long TTL + frequent restarts hits ServiceQuotaExceededException
-# ("Service Account Token quota has been reached"). 1 hour is long
-# enough for any practical invocation, short enough that leaked tokens
-# expire before they pile up. We ALSO actively delete stale "agent-mcp-"
-# tokens at startup (see _start_grafana_mcp), which is the real
-# defense against quota exhaustion.
-_GRAFANA_TOKEN_TTL_SECONDS = 3600  # 1 hour
-
-# Prefix used for tokens this module mints. Used at startup to identify
-# and delete leaked tokens from previous containers before minting a
-# fresh one (without this, ~10 leaks across restarts → quota error).
+# Prefix used to identify our tokens so we can clean them up without
+# touching tokens belonging to other integrations.
 _AGENT_TOKEN_NAME_PREFIX = "agent-mcp-"
 
 
 def _start_grafana_mcp() -> tuple[list, object | None]:
-    """Mint an EDITOR token and start the Grafana MCP subprocess.
+    """Mint an EDITOR token and spawn the mcp-grafana subprocess.
 
-    Returns ``(tools, cleanup)``. On any failure (missing env vars,
-    token mint denied, subprocess crash) returns ``([], None)`` after
-    logging a warning, so the rest of the agent keeps working.
+    Returns ``(tools, cleanup)``. If anything fails (missing env vars,
+    denied token, crashed subprocess) it returns ``([], None)`` after
+    logging a warning, so the rest of the agent stays up.
     """
-    # Configured by Terraform; missing in local dev — skip cleanly.
     if not (
         GRAFANA_WORKSPACE_ID
         and GRAFANA_WORKSPACE_ENDPOINT
@@ -134,13 +116,9 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
 
     grafana_ctl = boto3.client("grafana", region_name=REGION)
 
-    # Best-effort: delete any tokens left over from previous containers
-    # that didn't shut down gracefully. AMG enforces ~10 active tokens
-    # per service account; without this we hit
-    # ServiceQuotaExceededException after enough restarts. We only
-    # delete tokens whose name carries our prefix, so the Terraform
-    # provisioner token (in a different service account anyway) is
-    # untouched.
+    # Best-effort cleanup of orphan tokens carrying our prefix. If the
+    # IAM role lacks ListWorkspaceServiceAccountTokens we just log
+    # and continue.
     try:
         leftover = grafana_ctl.list_workspace_service_account_tokens(
             workspaceId=GRAFANA_WORKSPACE_ID,
@@ -154,9 +132,7 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
                         serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
                         tokenId=tok["id"],
                     )
-                    logger.info(
-                        "Cleaned leftover Grafana token: %s", tok["id"]
-                    )
+                    logger.info("Cleaned leftover Grafana token: %s", tok["id"])
                 except Exception as del_exc:  # noqa: BLE001
                     logger.debug(
                         "Could not delete leftover token %s: %s",
@@ -164,10 +140,6 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
                         del_exc,
                     )
     except Exception as list_exc:  # noqa: BLE001
-        # Listing is best-effort; if the IAM lacks the permission we
-        # just proceed and hope we're under quota. Worst case: a future
-        # restart hits the cap and the manual drain script in README
-        # is needed.
         logger.warning(
             "Could not list existing Grafana tokens (continuing): %s",
             list_exc,
@@ -195,9 +167,8 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
         lambda: stdio_client(
             StdioServerParameters(
                 command="mcp-grafana",
-                # Default transport is stdio; ``-t stdio`` is explicit
-                # so this keeps working if a future mcp-grafana version
-                # changes the default.
+                # stdio is the default, but we set it explicitly in
+                # case a future version changes the default.
                 args=["-t", "stdio"],
                 env={
                     "GRAFANA_URL": f"https://{GRAFANA_WORKSPACE_ENDPOINT}",
@@ -213,8 +184,6 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
             client.stop(None, None, None)
         except Exception:  # noqa: BLE001
             pass
-        # Best-effort token deletion; the token also expires on its own
-        # after _GRAFANA_TOKEN_TTL_SECONDS, so we never leak permanently.
         try:
             grafana_ctl.delete_workspace_service_account_token(
                 workspaceId=GRAFANA_WORKSPACE_ID,

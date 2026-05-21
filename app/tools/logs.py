@@ -1,24 +1,19 @@
-"""CloudWatch Logs tools that BYPASS Logs Insights.
+"""Log-reading tool that bypasses Logs Insights.
 
-The agent's primary path for log analytics (describe_log_groups,
-execute_log_insights_query, analyze_log_group, get_logs_anomaly_detectors,
-metric helpers...) goes through the AWS Labs CloudWatch MCP server (see
-``app/mcp_clients.py``). Those tools rely on Logs Insights internally,
-which has indexing lag (minutes for new log groups, especially for a
-backdated burst from the demo seeds).
+The agent's main analytics path for logs (describe_log_groups,
+execute_log_insights_query, analyze_log_group, etc.) goes through the
+AWS Labs CloudWatch MCP server (see ``app/mcp_clients.py``), which
+internally uses Logs Insights and therefore inherits its indexing lag.
 
-This module exposes ONE complementary tool, ``filter_log_events``, that
-uses the FilterLogEvents API directly — the same path the AWS Console's
-"Log events" tab uses. No indexing required; events are visible
-immediately after PutLogEvents. Use this when:
+This module exposes a single complementary tool, ``filter_log_events``,
+that calls the FilterLogEvents API directly (the same path the
+console's "Log events" tab uses). There is no indexing step: events
+become visible as soon as PutLogEvents lands them. Useful when
+Insights returns zero but the console clearly shows events.
 
-  - Recent events (last few minutes / hours) need to be read NOW.
-  - Insights queries are returning 0 results despite the console
-    showing events (the classic indexing-lag symptom).
-  - The user wants raw event JSON without aggregation.
-
-For stats / aggregations / wide historical time windows, prefer the
-MCP's ``execute_log_insights_query`` (cheaper for large scans).
+For aggregations, stats, or wide historical windows, prefer the MCP
+tool ``execute_log_insights_query`` — it is much cheaper on large
+scans.
 """
 
 from __future__ import annotations
@@ -31,8 +26,6 @@ from strands import tool
 
 from app.config import REGION
 
-# Module-level client, reused across invocations; thread-safe for the
-# read APIs used here. See concurrency note in app/main.py.
 _logs = boto3.client("logs", region_name=REGION)
 
 
@@ -44,40 +37,29 @@ def filter_log_events(
     log_stream_names: list[str] | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Read raw log events from a CloudWatch log group via FilterLogEvents.
+    """Read raw events from a log group via FilterLogEvents.
 
-    Bypasses Logs Insights — events appear here as soon as they are
-    ingested (no indexing lag), so this is the right tool when the user
-    expects to see recent activity and Insights is returning 0 results.
+    Does not use Logs Insights, so it is not affected by indexing lag.
+    This is the right tool when the user expects to see recent activity
+    and the Insights path is returning zero.
 
     Args:
-        log_group_name: Log group to read, e.g. ``"/cloudwatch-agent/demo"``.
-        filter_pattern: Optional CloudWatch Logs filter pattern. For
-            structured JSON logs use the JSON form, e.g.:
-
-              ``{ $.level = "ERROR" }``
-              ``{ $.service = "payments" && $.status_code = 500 }``
-              ``{ $.error_code = "OrderDBConnectionPoolExhausted" }``
-
-            Or a plain quoted word match (case-sensitive substring), e.g.
-            ``"timeout"``. Omit to fetch every event in the window. See
-            https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/FilterAndPatternSyntax.html.
-        lookback_minutes: How far back to look, ending at "now". Default
-            is ``20160`` (14 days) because the cost of a wide window is
-            bounded by ``limit`` (which caps the response payload), and a
-            narrow default would silently miss backdated demo data and
-            older events. Set a smaller value (e.g. 60) explicitly if
-            you only care about the last hour.
-        log_stream_names: Optional subset of stream names to read from
-            (e.g. ``["gateway", "orders"]``). Omit to scan every stream
-            in the group.
-        limit: Maximum events to return (FilterLogEvents caps a single
-            page at 10000; we only fetch one page to bound token usage).
+        log_group_name: log group name, e.g. ``"/cloudwatch-agent/demo"``.
+        filter_pattern: CloudWatch Logs filter pattern. For structured
+            JSON logs use the JSON form, e.g. ``{ $.level = "ERROR" }``
+            or ``{ $.service = "payments" && $.status_code = 500 }``.
+            Omit to pull everything within the window.
+        lookback_minutes: how far back from "now" to look. Default 20160
+            (14 days) because the cost of a wide window is bounded by
+            ``limit``, and a narrow default would miss backdated data.
+        log_stream_names: optional subset of streams. Omit to scan every
+            stream in the log group.
+        limit: maximum number of events to return (FilterLogEvents
+            returns up to 10000 per page; we only fetch one page).
 
     Returns:
-        List of ``{timestamp, log_stream_name, message}`` dicts. The
-        ``timestamp`` is ISO-8601 UTC; ``message`` is the raw event body
-        (already JSON for structured logs — the LLM can parse if needed).
+        List of ``{timestamp, log_stream_name, message}`` dicts, with
+        ``timestamp`` in ISO-8601 UTC and ``message`` as the raw body.
     """
     end_ms = int(datetime.now(UTC).timestamp() * 1000)
     start_ms = end_ms - lookback_minutes * 60 * 1000

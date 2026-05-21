@@ -1,28 +1,15 @@
-# #############################################################################
-# AgentCore Evaluator + Online Evaluation Config (post-hoc trace quality)
+# AgentCore Evaluator + OnlineEvaluationConfig: post-hoc evaluation of
+# the agent's traces with an LLM-as-a-Judge managed by AgentCore.
+# Complementary to the runtime judge_dashboard_quality tool, which is
+# the synchronous gate that blocks grafana_update_dashboard turn by
+# turn. This evaluator scores the FULL trace after the fact and
+# publishes scores in the AgentCore console.
 #
-# Complementary to the runtime ``judge_dashboard_quality`` tool in app/:
-#
-#   - judge_dashboard_quality (Python tool) — SYNCHRONOUS, in-loop gate
-#     that blocks ``grafana_update_dashboard`` until the LLM-as-a-judge
-#     approves the JSON. Per-invocation. Refine + re-judge.
-#
-#   - This file — POST-HOC, async grading of EVERY runtime trace by an
-#     AgentCore-managed Evaluator. Scores accumulate in AgentCore
-#     observability for trend monitoring, drift alerts, and "did we
-#     skip the judge gate?" detection. No effect on the live request.
-#
-# Two AWS resources are needed:
-#   1. AWS::BedrockAgentCore::Evaluator               (the rubric)
-#   2. AWS::BedrockAgentCore::OnlineEvaluationConfig  (the wiring)
-# Both live in awscc (not hashicorp/aws) — AgentCore is too new in
-# CloudFormation. The awscc provider is configured in providers.tf.
-# #############################################################################
+# The resources live under the awscc provider (not hashicorp/aws)
+# because AgentCore is too new in CloudFormation.
 
-# -----------------------------------------------------------------------------
-# Execution role the evaluator assumes to (a) read runtime traces from
-# CloudWatch Logs and (b) invoke the judge model on Bedrock.
-# -----------------------------------------------------------------------------
+# Execution role for the evaluator: reads traces (spans in aws/spans)
+# and invokes the judge model on Bedrock.
 data "aws_iam_policy_document" "evaluator_trust" {
   statement {
     effect  = "Allow"
@@ -39,11 +26,9 @@ data "aws_iam_policy_document" "evaluator_trust" {
       values   = [local.account_id]
     }
 
-    # Confused-deputy guard. Both the evaluator resource and the
-    # online-evaluation-config resource may show up as SourceArn when
-    # AgentCore assumes this role; the wildcard scoped to this
-    # account/region covers both without creating a dependency cycle
-    # (we can't reference the evaluator ARN from its own trust policy).
+    # Wildcard on SourceArn because both the evaluator and the
+    # online-evaluation-config can be the source when assuming this
+    # role. aws:SourceAccount already scopes to this account.
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
@@ -53,10 +38,9 @@ data "aws_iam_policy_document" "evaluator_trust" {
 }
 
 data "aws_iam_policy_document" "evaluator_permissions" {
-  # Invoke the LLM-as-judge model. Scoped to the Anthropic Opus 4.6
-  # inference profile (same as the agent's main model statement). If
-  # you switch evaluator_config.llm_as_a_judge.model_config to a
-  # different anthropic.* model, broaden as needed.
+  # Judge model invocation. Same Opus 4.6 the agent uses. If
+  # llm_as_a_judge.model_config is switched to a different model in
+  # the Anthropic family, adjust the ARNs here.
   statement {
     sid    = "EvaluatorInvokeJudgeModel"
     effect = "Allow"
@@ -71,9 +55,7 @@ data "aws_iam_policy_document" "evaluator_permissions" {
     ]
   }
 
-  # Read traces from the runtime's CloudWatch log group. The
-  # OnlineEvaluationConfig below points the evaluator at this log group;
-  # the evaluator scans it for spans and feeds them to the judge.
+  # Read spans from aws/spans (CloudWatch Transaction Search).
   statement {
     sid    = "EvaluatorReadRuntimeTraces"
     effect = "Allow"
@@ -90,10 +72,8 @@ data "aws_iam_policy_document" "evaluator_permissions" {
     resources = ["*"]
   }
 
-  # Emit the evaluator's own output (per-trace scores) — by default
-  # AgentCore writes results to a managed CloudWatch log group
-  # (resolved at runtime, visible via the online_evaluation_config
-  # ``output_config.cloudwatch_config.log_group_name`` attribute).
+  # Write the evaluator's output (a managed log group that AgentCore
+  # resolves at runtime).
   statement {
     sid    = "EvaluatorWriteOutput"
     effect = "Allow"
@@ -118,19 +98,9 @@ resource "aws_iam_role_policy" "evaluator" {
   policy = data.aws_iam_policy_document.evaluator_permissions.json
 }
 
-# -----------------------------------------------------------------------------
-# The evaluator itself — declarative rubric + model + numerical scale.
-#
-# level = TRACE: evaluates the FULL invocation trace (every tool call,
-# every model turn, the final response). TOOL_CALL would score each
-# tool call independently; SESSION would aggregate across multiple
-# invocations of the same runtime_session_id. TRACE matches our
-# "did the agent build sensible dashboards on THIS request" question.
-#
-# We deliberately reuse the same model_id as the main agent. Override
-# to a cheaper Anthropic profile if cost matters (the IAM statement
-# above is scoped to anthropic.claude-opus-4-6-v1* — broaden if needed).
-# -----------------------------------------------------------------------------
+# Evaluator. level=TRACE scores the full invocation (not per
+# individual tool_call nor per multi-turn session). Reuses Opus 4.6
+# as the judge; if you switch to Sonnet/Haiku adjust the IAM ARNs.
 resource "awscc_bedrockagentcore_evaluator" "quality" {
   evaluator_name = "${replace(var.project_name, "-", "_")}_quality"
   description    = "Post-hoc LLM-as-a-Judge over CloudWatch Agent traces; complements the runtime judge_dashboard_quality tool."
@@ -139,13 +109,12 @@ resource "awscc_bedrockagentcore_evaluator" "quality" {
 
   evaluator_config = {
     llm_as_a_judge = {
-      # Placeholders required by AgentCore at TRACE level for online
-      # evaluation: at least one of {context} or {assistant_turn} must
-      # appear (the {expected_response} ground-truth placeholder is
-      # forbidden in online configs — see AWS docs). The service
-      # injects the actual trace data at evaluation time. Output
-      # formatting (reason + score) is auto-appended by AgentCore;
-      # don't add it here.
+      # The instructions MUST include at least one of {context} or
+      # {assistant_turn} (placeholders required by AgentCore for
+      # TRACE-level online eval). The service injects the actual data
+      # at evaluation time. AgentCore automatically appends a
+      # "reason + score" suffix, so do not include output formatting
+      # here.
       instructions = <<-EOT
         You are evaluating a single CloudWatch → Grafana dashboard
         generation trace from an autonomous agent.
@@ -194,11 +163,9 @@ resource "awscc_bedrockagentcore_evaluator" "quality" {
       model_config = {
         bedrock_evaluator_model_config = {
           model_id = "us.anthropic.claude-opus-4-6-v1"
-          # Opus 4.6 rejects requests that set BOTH temperature and
-          # top_p ("`temperature` and `top_p` cannot both be specified
-          # for this model. Please use only one."). We pick
-          # ``temperature = 0`` for deterministic, reproducible
-          # scoring; do NOT add ``top_p`` here.
+          # Opus 4.6 rejects requests with both temperature AND top_p.
+          # We pick temperature=0 for deterministic scoring; do NOT
+          # add top_p here.
           inference_config = {
             temperature = 0.0
             max_tokens  = 800
@@ -234,46 +201,26 @@ resource "awscc_bedrockagentcore_evaluator" "quality" {
   }
 }
 
-# -----------------------------------------------------------------------------
-# Wire the evaluator to live runtime traces.
+# OnlineEvaluationConfig: wires the evaluator to live spans. The
+# runtime's OTLP spans land in aws/spans (account-global log group
+# created by CloudWatch Transaction Search; see README prerequisites).
+# The runtime log group /aws/bedrock-agentcore/runtimes/<id>-DEFAULT
+# only holds stdout/stderr, NOT spans, so it is not referenced here.
 #
-# AgentCore emits per-invocation traces to a CloudWatch log group named
-#   /aws/bedrock-agentcore/runtimes/<agent_runtime_id>-DEFAULT
-# (the runtime's IAM also grants logs:PutLogEvents on that prefix —
-# see iam.tf:RuntimeLogWriting). This config tells AgentCore: scan that
-# log group for spans tagged with the agent's service.name and feed
-# 100% of them to the evaluator above.
+# service_names follows the <runtime_name>.<endpoint_name> convention
+# of AgentCore.
 #
-# sampling_percentage = 100 is for demo. In a production stack with
-# high invocation volume, drop this to 5-20% to bound cost.
-# -----------------------------------------------------------------------------
-# OnlineEvaluationConfig reads OTLP SPANS, not container stdout. Per
-# the AgentCore Observability docs the spans land in the global
-# ``aws/spans`` log group (created automatically by CloudWatch
-# Transaction Search — see the AWS::Logs::TransactionSearchConfig
-# enablement step in the README). The runtime stdout log group
-# ``/aws/bedrock-agentcore/runtimes/<id>-DEFAULT`` is for the
-# container's print() / loguru output and does NOT contain the
-# spans the evaluator needs.
-#
-# service_names follows the format ``<runtime_name>.<endpoint_name>``
-# per the AWS docs example
-# (e.g. "strands_healthcare_single_agent.DEFAULT"). Our endpoint is
-# the auto-created DEFAULT one (see the note in runtime.tf), so we
-# build the string from the runtime name.
+# sampling_percentage=100 is fine for the demo; in production with
+# high traffic, lower it to 10-20% to bound cost.
 resource "awscc_bedrockagentcore_online_evaluation_config" "agent" {
   online_evaluation_config_name = "${replace(var.project_name, "-", "_")}_online_eval"
   description                   = "Routes cloudwatch_agent runtime spans to the quality evaluator."
 
   evaluation_execution_role_arn = aws_iam_role.evaluator.arn
 
-  # Start in ENABLED state so AgentCore processes traces as they
-  # arrive. Without this the resource is created with execution_status
-  # = "DISABLED" (the AWS API default for ``enableOnCreate=false``) and
-  # no traces are evaluated — you'd see the config in the console but
-  # zero scores. Toggle with the AgentCore CLI's
-  # ``agentcore pause online-eval`` / ``resume online-eval`` if you
-  # need to pause without destroying the resource.
+  # Without this the resource is created with execution_status=DISABLED
+  # (the API default when enableOnCreate=false) and processes nothing.
+  # To pause without a destroy, change to "DISABLED" and apply.
   execution_status = "ENABLED"
 
   evaluators = [
