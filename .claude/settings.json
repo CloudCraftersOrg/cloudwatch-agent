@@ -50,7 +50,8 @@
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('app/mcp_clients.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
       "Bash(python3 -c \"import ast; ast.parse\\(open\\('app/tools/judge.py'\\).read\\(\\)\\); ast.parse\\(open\\('app/prompts.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
       "Bash(awk 'NR==1{started=0} /^SYSTEM_PROMPT/{started=1; next} started{print}' /Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/app/prompts.py)",
-      "Bash(grep -n '\"cwagent\"\\\\|`cwagent`' /Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/app/prompts.py)"
+      "Bash(grep -n '\"cwagent\"\\\\|`cwagent`' /Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/app/prompts.py)",
+      "Bash(grep -E \"^#{1,3} \" /Users/santiago_castellanos/Repositories/pocs/cloudwatch-agent/README.md)"
     ]
   }
 }

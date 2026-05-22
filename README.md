@@ -1,54 +1,253 @@
-# cloudwatch-agent
+# CloudWatch Agent
 
-## What it does
+An AI agent that explores AWS CloudWatch state and publishes curated Grafana dashboards in Amazon Managed Grafana, without any human writing JSON or learning the Grafana API.
 
-This repository deploys an AI agent that talks to a user, explores an AWS account (CloudWatch logs, EC2/RDS/Lambda resources, metrics, alarms), and publishes dashboards in an Amazon Managed Grafana workspace without anyone having to write JSON or learn the Grafana API.
+The agent runs as an HTTPS endpoint behind Amazon Bedrock AgentCore Runtime. It reasons with Claude Sonnet 4.6, persists conversational state in Bedrock AgentCore Memory, validates every dashboard with a Claude Haiku 4.5 judge before publishing, and is graded post-hoc by a managed AgentCore Evaluator. Infrastructure deploys end-to-end with a single `terraform apply`.
 
-The agent runs as an HTTPS endpoint behind Amazon Bedrock AgentCore Runtime. It reasons with Claude Opus 4.6 on Bedrock, persists conversational state in Bedrock AgentCore Memory, and evaluates itself in two ways. A synchronous judge validates every dashboard JSON before publishing it. A managed AgentCore Evaluator scores each full trace after the fact.
+## 1. Executive summary
 
-All the infrastructure comes up with Terraform from a clean account. There is a local invocation script (`invoke.py`) with a colorful REPL for talking to the agent from a terminal, and two seed scripts that populate a CloudWatch log group with realistic JSON events so the agent has something concrete to visualize during a demo.
+| Aspect | What it is |
+|  |  |
+| Goal | Talk to AWS in natural language and get production-ready Grafana dashboards back. |
+| Primary surface | An AgentCore Runtime endpoint invoked by `invoke.py`, a polished CLI REPL. |
+| Reasoning model | `us.anthropic.claude-sonnet-4-6` (cross-region inference profile). |
+| Judge model | `us.anthropic.claude-haiku-4-5-20251001-v1:0`. ~5× faster than the main model. |
+| Conversation memory | Bedrock AgentCore Memory with three strategies: summarization, user preference, semantic facts. |
+| Tools | 4 custom + ~20 from AWS Labs CloudWatch MCP + ~10 from Grafana Labs MCP. |
+| Dashboard policy | A "canonical 5" invariant: 1 overview + 4 service deep-dives ranked by a tiered composite (errors > warnings > info). |
+| Quality gate | Two-stage judge: LLM structural rubric + real Logs Insights query execution per panel. |
+| Post-hoc evaluation | AgentCore Evaluator scoring every trace; results in the AgentCore console. |
+| Deployment | One `terraform apply` from a clean account. Image is built and pushed by Terraform itself. |
+| Demo data | Three seed scripts in `seeds/` simulating three "weeks" of evolving service traffic. |
 
-## Architecture
+## 2. Architecture
 
-The core component is a Python 3.13 container running on AgentCore Runtime in `us-east-1`. Inside the container, `app/main.py` boots a `BedrockAgentCoreApp` that exposes `POST /invocations`. On every invocation it builds a Strands `Agent` wired with three families of tools.
+```
+                                  ┌──────────────────────────────┐
+                                  │      Operator's terminal     │
+                                  │       (invoke.py REPL)       │
+                                  └──────────────┬───────────────┘
+                                                 │  HTTPS / SSE
+                                                 ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                       AgentCore Runtime (us-east-1)                        │
+│  ┌──────────────────────────────────────────────────────────────────────┐  │
+│  │  ARM64 microVM, Python 3.13 container, port 8080                     │  │
+│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  app/main.py — BedrockAgentCoreApp + Strands Agent             │  │  │
+│  │  │   ├─ system prompt (app/prompts.py)                            │  │  │
+│  │  │   ├─ ToolCallLimiter hook (35 calls/invocation cap)            │  │  │
+│  │  │   └─ session_manager → AgentCore Memory                        │  │  │
+│  │  │                                                                │  │  │
+│  │  │  Tool set (Strands):                                           │  │  │
+│  │  │   ├─ Custom    : filter_log_events, get_data_window,           │  │  │
+│  │  │   │              discover_resources, rank_services_by_priority,│  │  │
+│  │  │   │              get_cloudwatch_datasource,                    │  │  │
+│  │  │   │              judge_dashboard_quality,                      │  │  │
+│  │  │   │              delete_grafana_dashboard,                     │  │  │
+│  │  │   │              prune_dashboards_to_top_set                   │  │  │
+│  │  │   ├─ cw_mcp_*  : AWS Labs CloudWatch MCP subprocess (Python)   │  │  │
+│  │  │   └─ grafana_* : Grafana Labs MCP subprocess (Go binary)       │  │  │
+│  │  └────────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+└─────┬─────────────────────┬────────────────────┬──────────────┬────────────┘
+      │                     │                    │              │
+      ▼                     ▼                    ▼              ▼
+┌────────────┐   ┌──────────────────┐   ┌────────────────┐   ┌──────────────┐
+│  Bedrock   │   │   CloudWatch     │   │ AgentCore      │   │   Amazon     │
+│  Runtime   │   │  Logs + Metrics  │   │ Memory + Eval  │   │   Managed    │
+│ (Sonnet,   │   │  + X-Ray Spans   │   │                │   │   Grafana    │
+│   Haiku)   │   │                  │   │                │   │  (workspace) │
+└────────────┘   └──────────────────┘   └────────────────┘   └──────────────┘
+```
 
-The first family is three custom tools that live in `app/tools/`. `filter_log_events` reads raw events from CloudWatch Logs without going through Insights, which matters because Insights has indexing lag that can mislead the agent. `discover_resources` enumerates EC2, RDS, and Lambda. `get_cloudwatch_datasource` returns the UID of the CloudWatch datasource that Terraform provisioned inside the Grafana workspace, so the agent does not need to discover it every turn. There is a fourth custom tool, `judge_dashboard_quality`, that invokes a separate Bedrock model with a strict rubric to evaluate the quality of a dashboard JSON before it gets published.
+### 2.1 Container composition
 
-The second family is the tool set exposed by the AWS Labs CloudWatch MCP server (`awslabs.cloudwatch-mcp-server`). It runs as a stdio subprocess inside the same container and contributes around twenty tools for Logs Insights, metrics, alarms, and PromQL queries against CloudWatch Metrics Insights.
+| Layer | Source | Role |
+|  |  |  |
+| Base image | `python:3.13-slim` (linux/arm64) | Runtime for the agent. |
+| `mcp-grafana` binary | Built from source in a Go `1.24-bookworm` build stage | Provides `grafana_*` tools to Strands. |
+| Python deps | `uv sync --no-dev` against `pyproject.toml` + `uv.lock` | Strands, Bedrock SDK, AWS Labs CW MCP, rich, boto3, etc. |
+| App code | `app/` | Entrypoint, tools, prompt, MCP wiring. |
+| CMD | `uv run python -m app.main` | Plain entrypoint. **Not** `opentelemetry-instrument` — the OTLP exporter blocks when no collector is reachable inside the microVM. |
 
-The third family is the official Grafana Labs MCP server (`mcp-grafana`, a Go binary built in a dedicated Dockerfile stage and copied into the final container). It provides the full dashboard management surface: searching, reading, creating or updating with full JSON, patching specific changes, listing datasources, generating deep links, and rendering panels as PNG.
+### 2.2 Service accounts and token lifecycle
 
-To authenticate against Grafana, the agent does not keep a static token. When the container starts, it mints a short-lived EDITOR service-account token by calling the AWS Managed Grafana API, passes it as an environment variable to the `mcp-grafana` subprocess, and tries to delete it on shutdown. If the container restarts often and tokens accumulate, there is an automatic startup cleanup that removes any orphan tokens left behind by previous containers.
+The agent does **not** keep a static Grafana token. On every cold start `app/mcp_clients.py`:
 
-Conversational memory is persisted in Bedrock AgentCore Memory, configured with three strategies: summarization for summarizing long sessions, user preference for learning per-user preferences, and semantic facts for extracting relevant facts. Memory is per-session, which means continuity across turns depends on the client sending the same `runtimeSessionId`. The `invoke.py` REPL handles this automatically.
+1. Mints a short-lived `EDITOR` service-account token via the AMG control-plane API.
+2. Passes the token as `GRAFANA_SERVICE_ACCOUNT_TOKEN` env var to the `mcp-grafana` subprocess.
+3. Best-effort cleans up orphan tokens from prior containers (tier 1: expired-only; tier 2: quota recovery by deleting the oldest if ≥ 8 tokens are alive).
+4. Registers an `atexit` cleanup that revokes the token on shutdown.
 
-To evaluate agent quality in production, beyond the synchronous judge already mentioned, there is a TRACE-level AgentCore Evaluator configured in LLM-as-a-Judge mode. It reads OTLP spans from the account (in the account-global `aws/spans` log group that CloudWatch Transaction Search creates) and scores them against a rubric similar to the synchronous judge, but after the fact. The scores appear in the AgentCore console under Evaluation.
+### 2.3 Memory model
 
-## Before you start
+AgentCore Memory is configured with three strategies in `terraform/memory.tf`:
 
-### AWS account requirements
+| Strategy | What it captures |
+|  |  |
+| **summarization** | Rolling summaries of long sessions so the context window stays bounded. |
+| **user_preference** | Per-user preferences learned across sessions (e.g. preferred dashboard style). |
+| **semantic_facts** | Stable facts the user told the agent (e.g. "we deprecated the payments service"). |
 
-The agent uses Claude Opus 4.6 through the `us.anthropic.claude-opus-4-6-v1` inference profile, which fans traffic out between `us-east-1`, `us-east-2`, and `us-west-2`. You need to enable Model Access for Anthropic Claude Opus 4.6 in all three regions from the Bedrock console, in each one separately. If you only enable it in `us-east-1` (the main deploy region), the first invocation that lands in another region will fail with `AccessDeniedException` mentioning `aws-marketplace:Subscribe`. The runtime role intentionally lacks marketplace permissions because they are too broad, so the subscription has to be done by a human once.
+Continuity is per `runtimeSessionId`. `invoke.py`'s REPL reuses the same session id across turns automatically; one-shot mode generates a fresh id unless `--session-id` is passed.
 
-You need IAM Identity Center enabled in the account. Amazon Managed Grafana requires it so humans can log in. The agent itself does not use Identity Center (it authenticates with a Grafana service account), but the people who view the dashboards do. Identity Center is account-global but its instance lives in one specific region, normally the first one where the account was set up. If that region differs from the deploy region, you need to tell Terraform via an explicit variable, because the data sources that enumerate Identity Center users only see the instance from its home region.
 
-You need to enable CloudWatch Transaction Search in `us-east-1`. That creates the `aws/spans` log group that receives the OTLP spans emitted by AgentCore Observability. Without this, the AgentCore Evaluator has nothing to read from and stays in FAILED state at create time. You enable it once from the CloudWatch console under Application Signals.
+## 3. The reasoning model
 
-### Local tools
+This is the part that makes the agent's output predictable from one run to the next.
 
-You need Terraform 1.9 or higher, Python 3.13 managed by `uv` (the modern way to handle Python virtual environments), Docker with buildx installed, and AWS CLI v2 with valid credentials for the target account. On Intel machines you also need QEMU binfmt registered so buildx can compile `linux/arm64` images (which is the only architecture AgentCore Runtime accepts). This is a one-time command: `docker run --privileged --rm tonistiigi/binfmt --install arm64`. On Apple Silicon this is unnecessary because arm64 is native.
+### 3.1 Canonical-5 dashboard invariant
 
-## Step-by-step deploy
+The agent maintains **exactly five canonical dashboards** in the workspace at any time:
 
-The deploy is a single `terraform apply` from a clean account. There is no separate bootstrap step, no need to create ECR ahead of time, no need to push an image by hand. Terraform itself builds the container image and uploads it to ECR as part of the apply, using a `terraform_data.image` resource that invokes `docker buildx build` and `docker push` locally whenever it detects that any source file changed. This means the person running the apply needs Docker running on their machine.
+| Slot | UID | Title | Source |
+|  |  |  |  |
+| 1 | `cwagent-overview` | `CloudWatch Agent — Overview` | Cross-service summary. Permanent; never displaced. |
+| 2-5 | `cwagent-svc-<service>` | `CloudWatch Agent — <service>` | Per-service deep dive. One per top-4 service from the ranking. |
 
-### Step 1. Configure variables
+Incident dashboards (`cwagent-incident-<slug>`) sit **outside** the canonical 5 and are not auto-pruned.
 
-Copy `terraform/terraform.tfvars.example` to `terraform/terraform.tfvars` and edit it. The variables you usually need to set are `identity_center_region` (the region where you enabled Identity Center, for example `us-west-2` if it was the account's first region) and `grafana_admin_user_names` (list of Identity Center user names that should have the ADMIN role in Grafana, normally at least yours). The rest of the variables have reasonable defaults.
+When the data changes (a new high-error service appears, an old one goes quiet) the agent rebalances: re-ranks, swaps the lowest-priority service slot for the new winner, and calls `prune_dashboards_to_top_set` once at the end so the displaced dashboard is removed from Grafana.
 
-If you want an S3 remote backend for the state, copy `terraform/backend.tf.example` to `terraform/backend.tf` and fill in your bucket name. If you leave the backend local, the state stays on disk, which is fine for a demo but not for CI/CD.
+### 3.2 Tiered service ranking
 
-### Step 2. Apply Terraform
+`rank_services_by_priority` runs one Logs Insights query and assigns each service a **tier** plus a within-tier composite score:
+
+| Tier | Definition | Within-tier score |
+|  |  |  |
+| **1 — critical** | At least one `ERROR` in the window. | `0.5 · error_count + 0.3 · error_rate + 0.2 · p99_latency` (each normalized 0-1). |
+| **2 — degraded** | No errors but at least one `WARN`. | Same formula on warn metrics. |
+| **3 — healthy** | Only `INFO`. | Normalized traffic volume. |
+
+The tool returns services sorted by `(tier asc, composite_score desc)`. The agent takes the first four as slots 2-5, regardless of whether they're all in tier 1 or spread across tiers. This way slots are always filled and the user can tell "real problem" slots from filler.
+
+### 3.3 Mandatory build sequence
+
+When the user asks for "build / regenerate / refresh the dashboard set", the agent follows this exact sequence:
+
+| Step | Action | Tool(s) |
+|  |  |  |
+| 1. Discover | Pick the target log group (from user input or ask). Sample 5 events to learn the field shape. Fetch the CloudWatch datasource UID. | `cw_mcp_describe_log_groups`, `filter_log_events`, `get_cloudwatch_datasource` |
+| 2. Window | Read the actual oldest/newest event timestamps and get a recommended `time.from` value sized to fit the data. | `get_data_window` |
+| 3. Rank | Compute the tiered composite ranking for every service in the log group. | `rank_services_by_priority` |
+| 4. Build | Overview first, then services in priority order. For each: fetch existing version, assemble JSON, judge, iterate on `revise`, publish. | `grafana_get_dashboard_by_uid`, `judge_dashboard_quality`, `grafana_update_dashboard` |
+| 5. Prune | Delete any `cwagent-*` dashboard not in the new top set. Overview and incidents auto-preserved. | `prune_dashboards_to_top_set` |
+
+No hardcoded "primary" log group: the agent works with whichever log group the user names (or asks if ambiguous). The canonical-5 invariant assumes the log group has `service` + `level` fields; otherwise the agent falls back to an adapted structure (per-`@logStream` or per-error-pattern) and tells the user.
+
+### 3.4 Overview dashboard content contract
+
+The overview must be dense enough to answer "is everything OK right now, and which service is worst?" without clicking into any service dashboard. Minimum panel set (24-column grid):
+
+| Row | y | h | Panels |
+|  |  |  |  |
+| 1 — headline stats | 0 | 4 | total events · total ERRORs · overall error rate % · count of critical-tier services |
+| 2 — cross-service trends | 4 | 8 | request volume by service (stacked, top-4) · ERROR count by service (stacked, top-4) |
+| 3 — health signals | 12 | 8 | p99 latency by service (top-4) · log level distribution (ERROR/WARN/INFO stacked) |
+| 4 — drill-in tables | 20 | 8 | top 10 error messages · recent 50 ERROR events |
+
+Every panel uses `queryMode: "Logs"`, the chosen log group, `time.from` from `get_data_window`, and `bin(5m)` for time-series stats over a 60-minute data window.
+
+### 3.5 Dashboard tag scheme
+
+Three tags per dashboard, in this order:
+
+| Position | Value | Purpose |
+|  |  |  |
+| 1 | `cloudwatch-agent` (always) | Identifies every agent-owned dashboard. |
+| 2 | `overview` or the lowercase service name | Scope. |
+| 3 | One of `error-warning-info` / `error-warning` / `warning-info` / `error-info` / `error` / `warning` / `info` | Which log levels appear in the dashboard's data. Computed at build time from the ranking output. |
+
+Grafana auto-assigns chip colors from the tag string hash; we don't try to control which color lands where.
+
+## 4. Quality and observability
+
+The agent has two complementary evaluation layers.
+
+### 4.1 Synchronous judge (`judge_dashboard_quality`)
+
+Runs **before every** `grafana_update_dashboard` call. Two stages:
+
+**Stage 1 — Structural rubric.** A Bedrock Converse call to Claude Haiku 4.5 with a strict prompt. Checks schema, datasource references, `queryMode`, stable naming convention, layout, usefulness. Returns `{score, verdict, critique}`.
+
+**Stage 2 — Data-plane validation.** Only runs if stage 1 approves. For every log-mode panel, the judge issues a real `StartQuery` / `GetQueryResults` against CloudWatch Logs Insights over the dashboard's declared time range. Queries run **in parallel** via `ThreadPoolExecutor` (10 concurrent), so a 10-panel overview validates in ~5 s instead of ~50 s sequential. Any panel returning 0 rows or whose query errors becomes a critique entry prefixed `DATA-PLANE CHECK FAILED`, and the verdict is downgraded to `revise`.
+
+Verdict handling:
+
+| Verdict | Score | Agent action |
+|  |  |  |
+| `approve` | ≥ 8 **and** every panel returned data | Publish via `grafana_update_dashboard`. |
+| `revise` | 5-7, **or** any data-plane failure | Apply every critique item, re-judge. Cap: 3 iterations per dashboard. |
+| `reject` | < 5 | Rebuild from scratch using the critique as the spec. Re-judge. |
+
+Picking Haiku for the judge (instead of inheriting the main model) drops per-judge latency from ~3 s to ~0.6 s. With 5-15 judge calls per heavy turn that's 30-60 s shaved end-to-end.
+
+### 4.2 AgentCore Evaluator (post-hoc, async)
+
+A `level=TRACE` AgentCore Evaluator configured in LLM-as-a-Judge mode (Opus 4.6). It reads OTLP spans the runtime emits to the account-global `aws/spans` log group (created by CloudWatch Transaction Search) and scores each trace against a rubric similar to the synchronous judge — but after the fact. Scores appear in the AgentCore console under Evaluation.
+
+Wired by an `awscc_bedrockagentcore_online_evaluation_config` in `terraform/evaluator.tf`. Sampling defaults to 100% (good for a demo; lower in production).
+
+### 4.3 Runtime logs and metrics
+
+| Where | What |
+|  |  |
+| `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` | Container stdout/stderr: Python prints, exceptions, MCP boot logs, `invocation_prompt session_id=... prompt=...` audit lines for every request. |
+| `aws/spans` (account-global) | OTLP traces. Source for the AgentCore Evaluator. |
+| `CloudWatch › AWS/BedrockAgentCore` | Invocations, errors, latency, throttles. Native dashboard under AgentCore console → Observability. |
+
+Each invocation logs the user's prompt at INFO level so prompt ↔ response pairs can be correlated in Logs Insights:
+
+```
+filter @message like /invocation_prompt/
+| parse @message "session_id=* user_id=* prompt=*" as sid, uid, prompt
+```
+
+### 4.4 Tool-call budget
+
+Strands' `Agent` has no built-in loop bound — it iterates until the model emits `end_turn` without a tool call. A `_ToolCallLimiter` hook in `app/main.py` caps it at **35 tool calls per invocation**, which covers the worst-case canonical-5 rebuild (discovery + ranking + 5 × judge × 3 retries + 5 × publish + prune ≈ 30) with headroom. On overflow the hook cancels further tool calls with a message telling the model to summarize and respond.
+
+## 5. Deployment
+
+### 5.1 AWS account prerequisites
+
+| # | Item | Why |
+|  |  |  |
+| 1 | Bedrock model access for `anthropic.claude-sonnet-4-6` and `anthropic.claude-haiku-4-5-20251001-v1:0`, enabled in **all three** of `us-east-1`, `us-east-2`, `us-west-2` | Both `us.*` inference profiles fan out across these regions; missing access in any one yields `AccessDeniedException` mid-call. Opus 4.6 is also IAM-allowlisted as a fallback if you want to switch back via env var. |
+| 2 | IAM Identity Center enabled in the account | Amazon Managed Grafana requires it for SSO login. If Identity Center's home region differs from the deploy region, set `identity_center_region` in `terraform.tfvars`. |
+| 3 | CloudWatch Transaction Search enabled in the deploy region | Creates the `aws/spans` log group the AgentCore Evaluator reads from. **Manual** step — AWS does not expose a Terraform-friendly API. Toggle from CloudWatch console → Application Signals → Transaction Search → Enable. |
+
+### 5.2 Local tooling
+
+| Tool | Version | Purpose |
+|  |  |  |
+| Terraform | ≥ 1.9 | Infrastructure as code. |
+| `uv` | latest | Python venv + dependency resolution. |
+| Docker with buildx | latest | Container build. |
+| QEMU binfmt | one-time setup | Cross-arch build on amd64 hosts. Run `docker run --privileged --rm tonistiigi/binfmt --install arm64` once. Not needed on Apple Silicon. |
+| AWS CLI v2 | latest | Authenticated session for the target account. |
+
+### 5.3 Deploy steps
+
+**Step 1 — Configure Terraform variables.**
+
+```bash
+cp terraform/terraform.tfvars.example terraform/terraform.tfvars
+$EDITOR terraform/terraform.tfvars
+```
+
+Variables you typically set:
+
+| Variable | Purpose |
+|  |  |
+| `identity_center_region` | Region where IAM Identity Center lives, if different from the deploy region. |
+| `grafana_admin_user_names` | Identity Center user names that get the `ADMIN` role in Grafana (include at least yourself). |
+| `grafana_grant_all_users_role` | Default role for everyone in the identity store (default `VIEWER`; set to `""` to disable auto-grant). |
+
+If you want an S3 remote backend, also copy `terraform/backend.tf.example` to `terraform/backend.tf` and fill in the bucket name.
+
+**Step 2 — `terraform apply`.**
 
 ```bash
 cd terraform
@@ -56,152 +255,238 @@ terraform init
 terraform apply
 ```
 
-The first run takes between five and ten minutes. Most of that time is spent compiling the `mcp-grafana` binary with Go (downloading the module and building for `linux/arm64`), followed by the build and push of the full agent image. The resources get created in this logical order: the ECR repository, the agent image (build and push), the runtime IAM role, AgentCore Memory with its three strategies, the Amazon Managed Grafana workspace, the workspace service accounts (one admin for Terraform, one EDITOR for the agent at runtime), the CloudWatch datasource inside the workspace, the AgentCore Runtime with its DEFAULT endpoint, the AgentCore Evaluator with the quality rubric, and finally the OnlineEvaluationConfig that wires the evaluator to the `aws/spans` log group.
+First apply takes 5-10 minutes. Most of that is building `mcp-grafana` from Go source and pushing the container image. Resources come up in dependency order: ECR → image build/push → IAM → Memory → Grafana workspace → Grafana service accounts → CloudWatch datasource → AgentCore Runtime → AgentCore Evaluator → OnlineEvaluationConfig.
 
-When the apply finishes, Terraform prints several useful outputs: the runtime ARN, the Grafana URL, the workspace ID, and the ARNs of the evaluator and online evaluation config.
+Outputs include the runtime ARN, the Grafana workspace URL, the workspace ID, and the evaluator + online-eval config ARNs.
 
-### Step 3. Enable CloudWatch Transaction Search
+**Step 3 — Enable CloudWatch Transaction Search.**
 
-This step is manual because AWS does not expose a stable Terraform-friendly API for it. Open the AWS console in `us-east-1`, navigate to CloudWatch, find Application Signals in the left menu, open Transaction Search, and press Enable. AWS creates the `aws/spans` log group automatically.
+AWS Console → CloudWatch → Application Signals → Transaction Search → Enable. AWS creates `aws/spans` automatically. If you skip this, the AgentCore Evaluator hangs in FAILED state. Re-apply Terraform after enabling and the evaluator creates cleanly.
 
-If you skip this step, the AgentCore Evaluator stays in FAILED state saying the log group does not exist. If you already applied and forgot this step, re-apply Terraform after enabling Transaction Search and the evaluator will create cleanly.
+**Step 4 — Verify.**
 
-### Step 4. Verify things came up
+```bash
+# Grafana login works
+open "$(terraform -chdir=terraform output -raw grafana_workspace_url)"
 
-A couple of quick checks help confirm the base is healthy before invoking the agent. The first one is the Grafana workspace: `terraform output grafana_workspace_url` gives you the URL, open it in a browser, you should reach an IAM Identity Center login screen, authenticate, and land on Grafana's home dashboard as ADMIN (because your user is in `grafana_admin_user_names`).
+# Agent endpoint exists
+aws bedrock-agentcore-control list-agent-runtimes \
+  --region us-east-1 \
+  --query "agentRuntimes[?starts_with(agentRuntimeName,'cloudwatch_agent')]"
+```
 
-The second check is the agent itself. Make sure you have a seed inyected first (next step), because without data the agent does not have much to say.
-
-### Step 5. Seed demo data
-
-The agent is built to visualize structured CloudWatch logs. To have a concrete demo without waiting for real logs to appear, there are two scripts in `seeds/` that inject realistic JSON events (services `payments`, `orders`, `auth`, `gateway`, plus `checkout` in week two) into the log group `/cloudwatch-agent/demo`.
+**Step 5 — Seed demo data.**
 
 ```bash
 uv run python -m seeds.week1 --region us-east-1
 ```
 
-That command writes several thousand events spread uniformly over the last 60 minutes. The reason the seed uses such a short window is important and explained later in the demo data section. The short version: AWS Logs Insights only indexes events whose timestamp is later than the log group's `creationTime`, so if the seed wrote timestamps from several days ago the agent would see the log group as empty.
+See section 7 for the full three-week seed narrative.
 
-When the script finishes, it prints a summary table of how many events were written per service and per level (`INFO`, `WARN`, `ERROR`).
+## 6. Interacting with the agent
 
-There is a second seed (`seeds/week2`) you can run afterward to introduce changes on top of the first one: it adds a new service (`checkout`), removes a specific `WARN` pattern from `payments`, and inserts a burst of concentrated errors in the `orders` service. This is useful for demonstrating that the agent notices when data changes.
+### 6.1 `invoke.py`
 
-## Interacting with the agent
+A single Python entrypoint with two modes. ARN is resolved in this order:
 
-The recommended way is the `invoke.py` script in the repo root. It has two modes.
+1. `AGENT_RUNTIME_ARN` env var.
+2. `AGENT_RUNTIME_ARN` in `./.env`.
+3. `terraform output -json` in `terraform/`.
+4. `bedrock-agentcore-control:ListAgentRuntimes` filtered by `--runtime-name` (default `cloudwatch_agent`).
 
-### Interactive mode (REPL)
-
-If you run it with no arguments, it opens a REPL with a single session, which means the agent remembers what you said earlier (AgentCore Memory persists history across turns of the same `runtimeSessionId`).
+#### Interactive REPL
 
 ```bash
 uv run python invoke.py
 ```
 
-A banner appears with the runtime ARN, the generated session id, the user, and the available commands. Then a `▸` prompt waits for your input. Every time you send a message and the agent responds, the text comes through as live Markdown (bold, lists, headers, code blocks render with real formatting), followed by a line with the turn's stats (tokens and latency) and another with the path where the raw SSE stream was saved for later inspection.
+A banner panel shows the runtime ARN, session id, user, and command list. Then a `▸` prompt waits for input. The same session id is reused across turns, so AgentCore Memory carries context.
 
-REPL commands start with a colon. `:help` shows the full list, `:session` prints the current session id, `:new` rotates it to a fresh one (which breaks continuity with AgentCore Memory and starts a brand new conversation), `:raw` toggles between the pretty rendering and the raw mode (which dumps every SSE event verbatim, useful for debugging), and `:exit` quits. Ctrl-D also quits. If you press Ctrl-C while the agent is responding, that stream cancels but the REPL stays alive for the next prompt.
+REPL commands:
 
-### One-shot mode
+| Command | Effect |
+|  |  |
+| `:help` | Show command list. |
+| `:session` | Print the current session id. |
+| `:new` | Rotate to a fresh session id (breaks memory continuity). |
+| `:raw` | Toggle between rendered output and raw SSE event dump. |
+| `:exit` / `:quit` / `Ctrl-D` | Quit. |
+| `Ctrl-C` | Cancel the in-flight stream; REPL stays alive. |
 
-If you pass the prompt as an argument or pipe it from stdin, the script runs once and exits. There is no memory continuity unless you pass the same `--session-id` explicitly.
+#### One-shot
 
 ```bash
 uv run python invoke.py "List the existing Grafana dashboards"
 
 cat prompts/incident.md | uv run python invoke.py
-```
 
-If you want to chain several one-shots and keep memory, generate a long session id (33 characters minimum per AgentCore rules) and pass it to every invocation:
-
-```bash
+# Chain one-shots with shared memory:
 SID="cwagent-demo-$(date +%s)-aaaaaaaaaaaaaaaaaa"
-uv run python invoke.py --session-id "$SID" "Explore the /cloudwatch-agent/demo log group"
-uv run python invoke.py --session-id "$SID" "Now create the dashboards you proposed"
+uv run python invoke.py --session-id "$SID" "Explore the logs"
+uv run python invoke.py --session-id "$SID" "Now build the dashboards"
 ```
 
-### What to expect as a response
+#### `--export`
 
-For an open-ended question like "what can you do", the agent replies with a short list of capabilities and finishes quickly. For something more concrete like "read the demo logs and propose a dashboard set", the agent normally runs a sequence of tool calls (you see them appear as `⚡ tool_name` with a green check when they return), evaluates the proposed JSON internally with `judge_dashboard_quality`, iterates if the judge asks for a revise, publishes the dashboards with `grafana_update_dashboard`, and at the end gives you a list of URLs with names and UIDs.
+Writes a JSON session bundle to `./exports/` (configurable via `--export-dir`) when the REPL exits or on `:new`. Bundle contents per turn: prompt, cleaned assistant text blocks, tool call names, byte count, elapsed time, and the path to the raw SSE dump.
 
-## Quality and observability
+### 6.2 What you see on screen
 
-The agent has two complementary evaluation layers.
+| Element | When |
+|  |  |
+| `↪` marker | Beginning of each assistant text block (one per agent iteration). |
+| Rendered Markdown (bold, lists, tables, code blocks) | At each block close. The whole block prints at once via `rich.Markdown`. |
+| `⚡ tool_name` | A tool call has just been dispatched. |
+| `⏳ tool_name  3.2s` (spinner, live elapsed time) | A tool is in flight. Daemon thread refreshes the counter twice a second. |
+| `✓ <summary>` (green) | Tool succeeded. Summary is tool-specific: `5 services ranked`, `approve (score 9)`, `published cwagent-svc-risk`, etc. |
+| `✗ <error>` (red) | Tool failed. First 200 chars of the error message. |
+| `· in tokens · out tokens · latency ms` | End-of-turn stats. |
+| `── N bytes · Ts · raw → /tmp/agent-turn-N.json` | Final summary line + path where the raw SSE stream was archived. |
 
-### Synchronous judge (blocking)
+### 6.3 Streaming model
 
-The `judge_dashboard_quality` tool is a Bedrock Converse call (same Opus 4.6 model) with a strict rubric that looks at the dashboard JSON before publishing it. It returns a numeric score, a verdict (`approve`, `revise`, or `reject`), and a list of concrete issues. The agent's system prompt requires calling this tool before every `grafana_update_dashboard` and instructs it to iterate when the verdict is `revise`. This blocks the publication of dashboards with empty queries, wrong datasource UID references, misconfigured queryMode, or uids that do not follow the project convention (`cwagent-overview`, `cwagent-svc-<service>`, `cwagent-incident-<slug>`).
+- Text from the assistant is **buffered silently** while the spinner shows `✏️ writing`. At block close the whole block prints once as rendered Markdown.
+- This avoids the cursor-walk-back-and-clear trick used previously, which could wipe earlier prompts when row counts drifted on emoji or wrapped lines.
+- Side effect: prose doesn't appear character by character. The spinner's live elapsed counter and the per-iteration `↪` marker keep the experience feeling active.
+- Terminal scrollback is preserved across prompts — you can scroll up through every previous turn in a REPL session.
 
-The judge's cost is roughly one extra round-trip to Bedrock per dashboard published. For a set of five dashboards that is ten to fifteen extra seconds and a few thousand tokens. If latency bothers you for the demo, you can change the judge's model via the `JUDGE_MODEL_ID` environment variable pointing at a cheaper Sonnet or Haiku.
+### 6.4 Client read timeout
 
-### AgentCore Evaluator (post hoc)
+`invoke.py`'s `bedrock-agentcore` boto3 client is configured with `read_timeout=300` (5 min) and `retries={"max_attempts": 1}`. A streaming retry would re-invoke the agent from scratch — duplicating every tool call and the token bill — so retries are disabled by design.
 
-Independent of the synchronous judge, there is a TRACE-level AgentCore Evaluator running in the background. It reads OTLP spans that the runtime emits to `aws/spans`, runs them through the rubric hardcoded in `terraform/evaluator.tf` (which penalizes skipping the judge, malformed JSON, hallucinations, and inconsistent naming), and publishes scores in the AgentCore console.
+## 7. Demo data (seeds)
 
-To see them: AWS Console, look for Amazon Bedrock AgentCore (not Amazon Bedrock by itself), enter the service, and pick Evaluation in the left menu. You will see two sections, Custom evaluators (`cloudwatch_agent_quality`) and Online evaluation configurations (`cloudwatch_agent_online_eval`). In the second one, after invoking the agent at least once, scores appear per trace.
+Three seed scripts live in `seeds/`. Each writes structured JSON events into the same log group (`/cloudwatch-agent/demo`) and tells a small operational story.
 
-If scores do not show up even though the agent was invoked, the most likely cause is the online evaluation config sitting at `executionStatus = DISABLED`. That is controlled by the `execution_status` variable in Terraform and should be `ENABLED`. Another possible cause is that the `service_names` field does not match the real `service.name` AgentCore is emitting in its spans. Terraform uses `<agent-runtime-name>.DEFAULT` by convention.
+### 7.1 Data model
 
-### Runtime logs and metrics
+| Field | Type | Notes |
+|  |  |  |
+| `timestamp` | ISO-8601 UTC | When the event happened. |
+| `level` | `INFO` / `WARN` / `ERROR` | Severity. |
+| `service` | string | Which simulated service emitted the event. |
+| `message` | string | Free-form, sampled from per-service templates. |
+| `status_code` | int | HTTP-style status (200, 401, 429, 500, 504, …). |
+| `latency_ms` | int | Sampled from per-service `(low, high)` ranges. |
+| `request_id` | hex | Unique per event. |
+| `error_code` | string (only on incidents) | Distinctive code like `OrderDBConnectionPoolExhausted` so dashboards can pivot on it. |
 
-AgentCore Runtime writes the container's stdout and stderr to a log group named `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT`. That is where you find Python prints, exception traces, and the initialization logs of the MCP servers. Useful when something fails during the agent's handshake or when a tool raises an error the LLM did not surface to the user.
+### 7.2 The three weeks
 
-Runtime metrics (invocations, errors, latency, throttles) live in CloudWatch Metrics under the namespace `AWS/BedrockAgentCore`. The AgentCore console has a native dashboard in the Observability section.
+| Seed | Services touched | Narrative |
+|  |  |  |
+| `week1` | `payments`, `orders`, `auth`, `gateway` | Baseline. `payments` has a recurring `retrying downstream dependency` WARN. |
+| `week2` | + `checkout`, sharp `orders` incident | A new `checkout` service comes online. The week-1 `payments` WARN pattern disappears. A tight burst of `OrderDBConnectionPoolExhausted` lands in the last 10 minutes. |
+| `week3` | + `risk`, + `identity`; `payments` and `auth` deprecated | Two new high-error services come online (`risk` ~65% error rate, `identity` ~45%). `payments` and `auth` collapse to ~1% of their week-2 volume with only deprecation WARNs left. Sharp `RiskModelInferencePoolExhausted` incident. |
 
-## Demo data (seeds)
+Running each one demonstrates a different agent behavior: week1 = first build, week2 = rebalance + incident dashboard, week3 = aggressive rebalance with prune of deprecated services.
 
-The seeds live in `seeds/week1.py` and `seeds/week2.py`. Each one declares service profiles (how many events per level per day, what message templates, which status codes, which latency ranges) and optionally an incident burst. The shared logic lives in `seeds/_common.py`.
+### 7.3 The "no backdating" rule
 
-The important implementation detail is that the seeds do not backdate events. All timestamps are distributed uniformly over the last 60 minutes counting from the moment you run the script. This decision is deliberate and stems from a poorly documented limitation of CloudWatch Logs Insights: Insights only indexes events whose timestamp is later than the log group's `creationTime`. If the seed put timestamps from 13 days ago into a log group created 13 hours ago, those events sit in the log group (you see them in the Log events tab of the console and `filter_log_events` reads them just fine), but Insights refuses to touch them and returns `MalformedQueryException`. That breaks the agent's flow because it prefers Insights for aggregations.
+All seed events are spread uniformly across the last 60 minutes from the moment you run the script. This is deliberate.
 
-The practical consequence: do not delete the log group between runs. If you want to reset the data without losing the indexability property, delete the streams individually, not the whole log group:
+CloudWatch Logs Insights only indexes events whose timestamp is later than the log group's `creationTime`. If the seed wrote timestamps from 13 days ago into a log group that was created 13 hours ago, those events sit happily in the log group (the Console "Log events" tab shows them, `filter_log_events` reads them) but Insights silently returns 0 rows for any query over them, which breaks the agent's aggregation path.
+
+**Practical consequence:** never delete the log group between runs. To reset cleanly, delete the per-service **streams** instead:
 
 ```bash
-for s in $(aws logs describe-log-streams --region us-east-1 \
-            --log-group-name /cloudwatch-agent/demo \
-            --query 'logStreams[].logStreamName' --output text); do
-  aws logs delete-log-stream --region us-east-1 \
-    --log-group-name /cloudwatch-agent/demo --log-stream-name "$s"
+for s in payments orders auth gateway checkout risk identity; do
+  aws logs delete-log-stream --log-group-name /cloudwatch-agent/demo \
+    --log-stream-name "$s" --region us-east-1 2>/dev/null
 done
 ```
 
-Then you can run the seed again.
+Then re-run the seed.
 
-## Common tasks
+### 7.4 Running
 
-### Changing the Claude model
+```bash
+uv run python -m seeds.week1 --region us-east-1
+# ...prompt the agent to build the first dashboard set...
+uv run python -m seeds.week2 --region us-east-1
+# ...prompt: "regenerate the set; there's a recent orders incident, build a dashboard for it"...
+uv run python -m seeds.week3 --region us-east-1
+# ...prompt: "rebalance the set; the most critical services should occupy the per-service slots"...
+```
 
-By default the agent uses the inference profile `us.anthropic.claude-opus-4-6-v1`. If you want to use Sonnet or Haiku, edit the `MODEL_ID` environment variable on the runtime (in `terraform/runtime.tf`) and also the default value in `app/config.py`. Remember to enable Model Access for the new model in the fan-out regions (`us-east-1`, `us-east-2`, `us-west-2`), and to adjust the model ARN in the `InvokeBedrockModels` statement of the IAM (`terraform/iam.tf`).
+Each script prints a per-service event count summary and a notes section with suggested prompts.
 
-### Granting Grafana access to more people
+## 8. Suggested demo flow
 
-There are two mechanisms. The first is automatic: the `grafana_grant_all_users_role` variable (default `VIEWER`) gives the role you indicate to every user in the Identity Store. If you want everyone to be able to edit dashboards, set it to `EDITOR`. If you want to turn off the auto-grant, set it to `""`. The second mechanism is per-user: add user names to the `grafana_admin_user_names` array and those become ADMIN specifically. Re-apply Terraform after changing either of them.
+A 15-minute demo that exercises every layer:
 
-### Switching regions
+| Time | Action | What to point out |
+|  |  |  |
+| 0:00 | `terraform apply` finished, Grafana workspace is empty | One-command deploy. |
+| 0:30 | `uv run python -m seeds.week1` | Realistic JSON log events seeded into `/cloudwatch-agent/demo`. |
+| 1:00 | `uv run python invoke.py`, prompt: *"Build the canonical dashboard set for /cloudwatch-agent/demo"* | Watch the spinner, tool calls (`⚡ get_data_window`, `⚡ rank_services_by_priority`, `⚡ judge_dashboard_quality`, `⚡ grafana_update_dashboard`), and the final URL list. |
+| 5:00 | Open Grafana, walk through the 5 dashboards | Overview density, tier-driven service slots, panels populated with data on first open thanks to `get_data_window`. |
+| 8:00 | `uv run python -m seeds.week2` (introduces incident) | Data has changed. |
+| 8:30 | Prompt: *"Regenerate the dashboard set and build an incident dashboard for the recent orders outage"* | Agent rebalances; `grafana-incident-<slug>` dashboard appears. |
+| 11:00 | `uv run python -m seeds.week3` (introduces risk + identity, deprecates payments + auth) | Data changes again. |
+| 11:30 | Prompt: *"Rebalance"* | Watch the prune step delete the displaced `cwagent-svc-payments` and `cwagent-svc-auth` dashboards. New `cwagent-svc-risk` and `cwagent-svc-identity` take their place. |
+| 13:00 | AgentCore Console → Evaluation | Post-hoc evaluator scores for the recent traces. |
+| 14:00 | Show `/aws/bedrock-agentcore/runtimes/<id>-DEFAULT` log group | `invocation_prompt` audit lines and full per-tool execution trace. |
 
-Almost everything is parameterized by `var.region` and moves by changing that value in `terraform.tfvars`. The exceptions are the three fan-out regions of the Claude inference profile, hardcoded in the IAM wildcards (no need to change them unless you migrate to a different inference profile), and the account-global `aws/spans` log group, which lives in the deploy region. If Identity Center lives in a different region from the new deploy region, also adjust `identity_center_region`.
+## 9. Operational guide
 
-### Pausing the AgentCore Evaluator without destroying it
+### 9.1 Switching models
 
-Set `execution_status = "DISABLED"` in `terraform/evaluator.tf` and apply. To reactivate it, set it back to `"ENABLED"` and apply. You can also do this from the AgentCore console, but keep in mind that the next `terraform apply` will overwrite the manual change unless you also modify the code.
+The defaults are encoded in three places that must stay in sync:
 
-## Troubleshooting
+| File | Variable | Default |
+|  |  |  |
+| `app/config.py` | `MODEL_ID` (env-overridable) | `us.anthropic.claude-sonnet-4-6` |
+| `app/tools/judge.py` | `JUDGE_MODEL_ID` (env-overridable) | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
+| `terraform/runtime.tf` | `MODEL_ID`, `JUDGE_MODEL_ID` env vars on the runtime resource | same as above |
+| `terraform/iam.tf` | `InvokeBedrockModels` statement | Whitelists Sonnet 4.6, Haiku 4.5, Opus 4.6 inference-profile + foundation-model ARNs |
 
-### The agent says it cannot find events in `/cloudwatch-agent/demo`
+To swap (e.g. back to Opus 4.6 for the main agent), change the value in `terraform/runtime.tf`, set the IAM if a new model needs allowlisting, and `terraform apply`.
 
-There are three usual causes. First, the seed never ran in the deploy region (check `aws logs describe-log-groups --region <region>` and verify that `storedBytes` is greater than zero). Second, the seed did run but the timestamps fell before the log group's `creationTime` (this happens if you deleted the log group and re-ran the seed; see the demo data section). Third, the account does not have Transaction Search enabled and the agent tried Insights before indexing catches up (wait a few minutes and retry, or explicitly ask the agent to use `filter_log_events`).
+### 9.2 Granting Grafana access
 
-### Grafana login returns `sso.auth.access-denied`
+| Mechanism | Variable | Effect |
+|  |  |  |
+| Per-user ADMIN | `grafana_admin_user_names` | Each listed Identity Store username gets the `ADMIN` role. |
+| Bulk role for everyone | `grafana_grant_all_users_role` | Default `VIEWER`. Set to `EDITOR` to give everyone edit rights, or `""` to disable. Excludes the admin users so they don't collide on lower-priority associations. |
 
-Your Identity Center user does not have a role association on the workspace. Verify that you are in `grafana_admin_user_names` or that `grafana_grant_all_users_role` is not empty. Also check that `identity_center_region` points to the correct region. After any change in those variables, apply Terraform and refresh the Grafana page.
+Both take effect on the next `terraform apply`.
 
-### Bedrock says `aws-marketplace:Subscribe`
+### 9.3 Pausing the AgentCore Evaluator
 
-That means the Claude model is not enabled in one of the fan-out regions of the inference profile. Open the Bedrock console in `us-east-1`, `us-east-2`, and `us-west-2` separately, and enable Anthropic Claude Opus 4.6 in each.
+Change `execution_status` in `terraform/evaluator.tf` from `"ENABLED"` to `"DISABLED"` and apply. The evaluator stops scoring new traces without being destroyed. Flip back to re-enable.
 
-### `Service Account Token quota has been reached`
+### 9.4 Switching deploy region
 
-AMG limits active tokens per service account (around ten). If AgentCore Runtime restarted the container many times without a clean shutdown, the tokens minted at startup pile up. The `app/mcp_clients.py` cleans up orphans at startup, but if the IAM role lacks `grafana:ListWorkspaceServiceAccountTokens` (added in recent versions) the cleanup did not work and the limit was reached. Manual fix: list and delete every token for the `cloudwatch-agent` service account:
+Most resources are parameterized by `var.region` (set in `terraform.tfvars`). Exceptions to be aware of:
+
+- The Bedrock inference profile fan-out regions are properties of the profile itself — they don't follow `var.region`.
+- The `aws/spans` log group lives in the deploy region (it's account-global, but the data plane is regional).
+- If Identity Center's home region differs from the new deploy region, set `identity_center_region` explicitly.
+
+## 10. Troubleshooting
+
+### 10.1 Agent says it can't find events in the log group
+
+Three usual causes:
+
+1. **Seed never ran in the deploy region.** Verify with `aws logs describe-log-groups --region <region>` that `storedBytes > 0`.
+2. **Timestamps fell before the log group's `creationTime`.** Happens if the log group was deleted and recreated. The Console shows events but Insights returns 0. Reset by deleting the streams, not the log group (see §7.3).
+3. **Transaction Search not enabled.** Insights queries against fresh log groups have 5-15 min indexing lag. `filter_log_events` (which goes through `FilterLogEvents`, no indexing) sees data immediately; the agent falls back to it automatically when configured correctly.
+
+### 10.2 Grafana login returns `sso.auth.access-denied`
+
+Your Identity Center user has no role association on the workspace. Check that you're in `grafana_admin_user_names` or that `grafana_grant_all_users_role` is non-empty. If Identity Center lives in a different region from the deploy, also confirm `identity_center_region`. Re-apply and refresh the Grafana page.
+
+### 10.3 Bedrock returns `aws-marketplace:Subscribe` or `AccessDeniedException` mid-call
+
+The selected model is not enabled in one of the inference-profile fan-out regions. Open the Bedrock console in **each** of `us-east-1`, `us-east-2`, `us-west-2` separately and enable model access for both Sonnet 4.6 and Haiku 4.5.
+
+### 10.4 `Service Account Token quota has been reached`
+
+AMG caps active tokens per service account at ~10. If the container restarts frequently without a clean shutdown, tokens accumulate. The container's startup cleanup deletes expired tokens and force-deletes the oldest when ≥ 8 of "ours" are alive — but if the IAM role lacks `grafana:ListWorkspaceServiceAccountTokens`, the cleanup can't run.
+
+Manual recovery:
 
 ```bash
 WS_ID=$(aws grafana list-workspaces --region us-east-1 \
@@ -218,52 +503,69 @@ for TID in $(aws grafana list-workspace-service-account-tokens \
 done
 ```
 
-Apply Terraform again so the next time the container starts the automatic cleanup runs.
+Then `terraform apply` so the next container start re-mints cleanly.
 
-### "Network error" when using the AgentCore web console
+### 10.5 The AgentCore Evaluator stays in `DISABLED`
 
-The AgentCore Runtime console has a browser-side SSE viewer that is fragile with long responses. The agent filters non-JSON-serializable events server side to keep the payload size under control, but if a response is still large (several MB), the browser may drop the connection and show that generic error. The robust alternative is to invoke from the CLI with `invoke.py`, which uses boto3 directly and handles streams of any size without problems.
+Two causes:
 
-### The AgentCore Evaluator stays in `DISABLED`
+1. `execution_status` was left at the API default (`DISABLED`) at create time. Set it to `"ENABLED"` in `terraform/evaluator.tf` and apply.
+2. The `aws/spans` log group doesn't exist (Transaction Search never enabled). The resource's underlying state is FAILED but surfaces as DISABLED. Enable Transaction Search and re-apply.
 
-That means `execution_status` was not set to `ENABLED` at creation time. Check the value in `terraform/evaluator.tf` and apply again. It can also happen that the resource was created but the `aws/spans` log group does not exist (Transaction Search was never enabled), in which case the real state is FAILED and it surfaces as DISABLED.
+### 10.6 `ReadTimeoutError` from `invoke.py`
 
-## Cleanup
+The client's `read_timeout` is 300 s. If a single turn exceeds that — usually because the model is in a tool-call loop — the underlying request is still alive on the server. Check the runtime log group for the in-flight invocation. The `_ToolCallLimiter` (35-call cap) should prevent infinite loops but doesn't shrink each individual model round.
 
-To destroy everything:
+### 10.7 "Network error" in the AgentCore web console
+
+The browser-side SSE viewer is fragile on large responses. The server-side filter in `app/main.py` drops non-JSON-serializable events to keep payloads sane, but multi-MB streams can still trip the browser. Use `invoke.py` instead — boto3 handles streams of any size cleanly.
+
+## 11. Cost notes
+
+| Component | Driver | Estimate for the demo |
+|  |  |  |
+| Bedrock — Sonnet 4.6 (main agent) | Input + output tokens | A full canonical-5 rebuild ≈ 80-120k tokens total across all model rounds. |
+| Bedrock — Haiku 4.5 (judge) | Input + output tokens | 5-15 judge calls per rebuild × ~3k tokens each. Cheaper than Sonnet by ~5×. |
+| AgentCore Runtime | vCPU-seconds + GB-seconds on the microVM | Negligible at demo traffic. |
+| AgentCore Memory | Events stored + strategy processing | Cheap unless you accumulate thousands of sessions. |
+| AgentCore Evaluator | Per-trace evaluation tokens | Defaults to 100% sampling — lower in production via `sampling_percentage` in `terraform/evaluator.tf`. |
+| Amazon Managed Grafana | Per active user per month | The agent's service account is **not** billable. Identity Center users with role associations are. |
+| CloudWatch Logs | GB ingested + stored | `aws/spans` grows with invocation count. Set retention if it matters. |
+| ECR | GB-month storage | Negligible — `terraform/ecr.tf` has a lifecycle policy that prunes old image tags. |
+
+To minimize cost in a long-running demo:
+
+- Lower `sampling_percentage` in `terraform/evaluator.tf` from 100 to 10-20.
+- Set `grafana_grant_all_users_role = ""` if not everyone needs Grafana access.
+- Switch `JUDGE_MODEL_ID` to Haiku (already the default — confirm it's not overridden).
+
+## 12. Cleanup
 
 ```bash
 cd terraform
 terraform destroy
 ```
 
-This removes the AgentCore Runtime, memory, evaluator rubric, online evaluation config, Grafana workspace (including any dashboards the agent created, its service accounts and tokens), the ECR repository (including all images), the IAM roles, and the runtime's own log group at `/aws/bedrock-agentcore/runtimes/<id>-DEFAULT`.
+This removes: AgentCore Runtime, Memory, Evaluator, OnlineEvaluationConfig, Grafana workspace (and all dashboards + service accounts + tokens), ECR repository (and all images), IAM roles, and the runtime's own log group.
 
-There are things Terraform does not manage and stay around: the `/cloudwatch-agent/demo` log group (the seeds created it directly) and the `aws/spans` log group (CloudWatch Transaction Search created it). If you want to clean them up:
+**Terraform does not own** these and they stay around:
+
+- `/cloudwatch-agent/demo` (created by the seed scripts directly via `PutLogEvents`).
+- `aws/spans` (created by Transaction Search when you enabled it).
+
+Delete manually if needed:
 
 ```bash
 aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-east-1
 aws logs delete-log-group --log-group-name aws/spans --region us-east-1
 ```
 
-If `terraform destroy` runs more than 30 days after the last `apply`, the provisioner token used by the Grafana provider to administer the datasource has already expired (the AMG maximum TTL is 30 days) and the destroy will hang trying to delete the datasource. The workaround is to recreate the token first:
+### Stale-token edge case
+
+If `terraform destroy` runs more than 30 days after the last `apply`, the provisioner token used by the Grafana provider to administer the workspace datasource has expired (AMG max TTL is 30 days) and the destroy hangs trying to delete the datasource. Workaround:
 
 ```bash
 terraform -chdir=terraform apply \
   -replace=aws_grafana_workspace_service_account_token.terraform
 terraform -chdir=terraform destroy
 ```
-
-## Cost notes
-
-The most expensive piece is Bedrock with Claude Opus 4.6, which is billed per input and output token. A typical set of five dashboards consumes between 80,000 and 120,000 tokens in total (across multiple tool-call turns). If token count matters, switching the model to Sonnet or Haiku is worth it (with the caveat that they have less reasoning capacity and dashboard quality drops).
-
-Amazon Managed Grafana bills per active user per month, with different rates for admins/editors versus viewers. The agent's service account does not count as a billable user. People entering through Identity Center do, so it pays to review who you default to the `VIEWER` role.
-
-AgentCore Runtime bills for microVM usage (vCPU-seconds and GB-seconds of memory). For a demo with low traffic it is negligible.
-
-Bedrock AgentCore Memory bills per stored event and per strategy processing. With the three strategies enabled and low session cardinality, it stays very cheap.
-
-CloudWatch Logs bills per GB ingested and stored, which is the usual story. The `aws/spans` log group can grow if you have many invocations; adjust retention if you notice it.
-
-The Bedrock AgentCore Evaluator bills per evaluated trace and per judge model tokens. The online evaluation config's sampling rate is set to 100% by default, which is good for a demo but worth lowering to something like 10% or 20% if you leave the agent running in production.
