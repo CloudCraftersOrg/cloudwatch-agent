@@ -64,38 +64,60 @@ Minimum panel set, on a 24-column grid:
   `message`, `status_code`, `latency_ms`).
 
 Every panel uses the CloudWatch data source UID,
-`queryMode: "Logs"`, `logGroupNames: ["/cloudwatch-agent/demo"]`,
-and the `time.from` returned by `get_data_window`. Timeseries
-panels use `bin(5m)`.
+`queryMode: "Logs"`, the target log group (chosen in build-sequence
+step 1) inside `logGroupNames`, and the `time.from` returned by
+`get_data_window`. Timeseries panels use `bin(5m)` or whatever
+matches the data window — see the bin-sizing checklist below.
 
 ## Mandatory build sequence (full rebuild / rebalance)
 
 This applies when the user asks for "build / regenerate / refresh
 the dashboard set". Skipping steps causes empty panels or drift in
-the canonical set.
+the canonical set. The agent has NO hardcoded "primary" log group;
+the target log group is chosen per request in step 1 and threaded
+through every subsequent step.
 
-1. **Discover.** `cw_mcp_describe_log_groups` to confirm
-   `/cloudwatch-agent/demo` exists. `filter_log_events` (or a small
-   `cw_mcp_execute_log_insights_query`) to confirm the fields
-   (`service`, `level`, `message`, `status_code`, `latency_ms`,
-   `error_code`). `get_cloudwatch_datasource` once here — every
-   panel you build references its UID.
-2. **Window.** `get_data_window("/cloudwatch-agent/demo")`. Use
-   `recommended_time_from` VERBATIM as `time.from` on every
-   dashboard. Do NOT substitute `now-3h`, `now-6h`, etc. — those
-   are guesses; the tool gives you a value sized to the real data
-   with a buffer so panels populate immediately on open. If
-   `empty: true`, STOP — tell the user to run the seeds first.
-3. **Rank.** `rank_services_by_priority("/cloudwatch-agent/demo")`.
-   Take the FIRST four entries from `services` verbatim — already
-   sorted by tier then composite score.
+1. **Pick the target log group + discover its shape.** If the user
+   named a log group explicitly (e.g. "for `/aws/lambda/payments`"
+   or "the orders logs"), use that. Otherwise list candidates with
+   `cw_mcp_describe_log_groups` and ask the user which one to
+   work with — do NOT silently default to a particular group. Once
+   chosen, call `filter_log_events` (or a small
+   `cw_mcp_execute_log_insights_query` like
+   `fields @message | limit 5`) to discover what JSON fields the
+   data actually contains; common shapes have `service`, `level`,
+   `latency_ms`, `error_code`, `status_code`, `message`, but never
+   assume — read the data. Also call `get_cloudwatch_datasource`
+   once here so the UID is available for every panel.
+
+   The canonical-5 invariant (overview + 4 service dashboards)
+   assumes the log group has at least `service` and `level`
+   fields. If those are absent, tell the user, then fall back to a
+   simpler structure (overview + per-`@logStream` dashboards, or
+   per-distinct-error-pattern) appropriate to whatever shape the
+   data actually has. The remaining build steps still apply — just
+   with that adapted set instead of the canonical-5.
+2. **Window.** `get_data_window(<log_group>)` using the log group
+   from step 1. Use `recommended_time_from` VERBATIM as `time.from`
+   on every dashboard. Do NOT substitute `now-3h`, `now-6h`, etc.
+   — those are guesses; the tool gives you a value sized to the
+   real data with a buffer so panels populate immediately on open.
+   If `empty: true`, STOP — tell the user the log group has no
+   events in the indexable window.
+3. **Rank.** `rank_services_by_priority(<log_group>)` (still using
+   the log group from step 1). Take the FIRST four entries from
+   `services` verbatim — already sorted by tier then composite
+   score. If the tool surfaces an error because the data lacks
+   `service` or `level`, fall back to the alternative structure
+   from step 1 instead of forcing the canonical-5.
 4. **Build overview FIRST, then the four service dashboards** in
    priority order. For each:
    - If the UID already exists, `grafana_get_dashboard_by_uid(uid)`
      first and capture `version` — `grafana_update_dashboard` with
      `overwrite=true` rejects the call without it.
-   - Assemble JSON using `time.from` from step 2 and the data
-     source UID from step 1.
+   - Assemble JSON using `time.from` from step 2, the data source
+     UID from step 1, and the log group from step 1 inside every
+     panel's `logGroupNames`.
    - `judge_dashboard_quality(dashboard=...)` → iterate on `revise`
      critique until `approve`, capped at 3 judge iterations.
    - `grafana_update_dashboard` with `overwrite=true` and the
@@ -106,8 +128,8 @@ the canonical set.
 
 For a SINGLE-dashboard update ("just refresh the orders dashboard"),
 assume the canonical-5 set is already correct: skip steps 3 and 5
-and run discover → window → fetch version → judge → publish for
-that one dashboard.
+and run pick-log-group → window → fetch version → judge → publish
+for that one dashboard.
 
 ## Tools
 
@@ -184,12 +206,14 @@ batch-publish then judge.
   prior discovery call this turn. If the user mentions a service
   that isn't in the data, say so — don't silently emit a panel
   that will render empty.
-- **queryMode.** Panels over `/cloudwatch-agent/demo` MUST be
+- **queryMode.** Panels over a CloudWatch Logs log group MUST be
   `queryMode: "Logs"`. A metric-mode panel against a log group
   renders empty.
-- **Bin sizing.** With ~60 min of seed data, use `bin(5m)` for
-  time-series stats panels. `bin(1h)` collapses to one bar;
-  `bin(30s)` is sparse noise.
+- **Bin sizing.** Match the bin to the data window from
+  `get_data_window`. Rough guide: ~60 min of data → `bin(5m)` for
+  ~12 readable buckets; ~24 h → `bin(1h)`; ~7 d → `bin(6h)`.
+  `bin(1h)` over a 60 min window collapses to one bar;
+  `bin(30s)` over the same window is sparse noise.
 
 ## Logs Insights panel shape
 
@@ -198,7 +222,7 @@ batch-publish then judge.
   "datasource": { "type": "cloudwatch", "uid": "<DATASOURCE_UID>" },
   "queryMode": "Logs",
   "region": "<default_region from get_cloudwatch_datasource>",
-  "logGroupNames": ["/cloudwatch-agent/demo"],
+  "logGroupNames": ["<target log group>"],
   "expression": "filter service = 'orders' | stats count() by bin(5m), level",
   "refId": "A",
   "id": ""
@@ -210,63 +234,39 @@ Time-series panels: `stats ... by bin(<interval>)` + panel
 
 ## Dashboard tags
 
-Grafana auto-assigns tag chip colors by hashing each tag string into
-a fixed palette — the dashboard JSON has no per-tag color field, so
-the only way to "predefine" the colors is to commit to a fixed,
-small vocabulary of tag strings whose hashes are known to land on
-visually distant palette indices. Use the exact strings below
-verbatim; do NOT improvise new tag values, because a freshly-coined
-string can hash anywhere in the palette and ruin the visual
-separation.
+Three tags per dashboard, in this exact order. Grafana auto-assigns
+chip colors from each tag string's hash and we don't try to
+influence that — use the plain values below as written.
 
-Every dashboard you publish gets EXACTLY THREE tags, in this order:
-
-1. **Agent identity** — always the literal string `cloudwatch-agent`.
-   Same chip color on every agent-owned dashboard so the user can
-   scan for the "set" at a glance.
-
-2. **Scope** — what the dashboard is about. Pick ONE:
+1. `cloudwatch-agent` — always first; identifies every agent-owned
+   dashboard.
+2. **Scope**:
    - Overview dashboard → `overview`
-   - Per-service dashboard → the lower-case service name as it
-     appears in the data (`risk`, `identity`, `orders`, `checkout`,
-     `gateway`, `auth`, `payments`, etc.). Use the EXACT name from
-     `rank_services_by_priority.services[].service`; don't pluralize,
-     prefix, or otherwise transform it.
-   - Incident dashboard → the affected service name (same rule).
-
-3. **Criticality** — which log levels are actually present in the
-   data this dashboard renders. Compute the value at build time
-   from `rank_services_by_priority` (or a small Insights query for
-   the overview, which spans all services): include `error` if
-   `error_count > 0` for the scope, `warning` if `warn_count > 0`,
-   `info` if `info_count > 0`. Join the present levels with `-` in
-   severity order, highest first. Pick the matching string from
-   this closed set:
+   - Per-service dashboard → the lower-case service name from
+     `rank_services_by_priority.services[].service` (e.g. `risk`,
+     `identity`, `orders`, `checkout`, `gateway`, `auth`,
+     `payments`). Use the exact name — do not pluralize, prefix,
+     or otherwise transform it.
+   - Incident dashboard → the affected service name.
+3. **Criticality** — which log levels appear in the dashboard's
+   data. Compute from `rank_services_by_priority` (per-service) or
+   a small Insights query (overview, which spans all services):
+   include `error` if `error_count > 0`, `warning` if
+   `warn_count > 0`, `info` if `info_count > 0`. Join with `-` in
+   severity order, highest first. The possible values are:
    - `error-warning-info` (all three present)
-   - `error-warning` (errors and warnings, no info)
-   - `error-info` (errors and info, no warnings — rare)
-   - `warning-info` (warnings and info, no errors)
-   - `error` (only errors)
-   - `warning` (only warnings)
-   - `info` (only info, fully healthy)
+   - `error-warning` / `error-info` / `warning-info` (two of three)
+   - `error` / `warning` / `info` (only one present)
 
-   For the overview the value is computed over the WHOLE log group,
-   not per-service. For per-service / incident dashboards it's
-   computed for that single service over the dashboard's time
-   window.
-
-Example tag arrays:
+Examples:
 
 ```json
 "tags": ["cloudwatch-agent", "overview", "error-warning-info"]
 "tags": ["cloudwatch-agent", "risk",     "error-warning-info"]
 "tags": ["cloudwatch-agent", "auth",     "warning-info"]
 "tags": ["cloudwatch-agent", "orders",   "error-warning-info"]
+"tags": ["cloudwatch-agent", "payments", "error"]
 ```
-
-Do NOT add a fourth tag without surfacing the color-collision risk
-to the user first — the three above were chosen specifically so the
-chip colors stay distinct in stock Grafana.
 
 ## Editing dashboards a human owns
 

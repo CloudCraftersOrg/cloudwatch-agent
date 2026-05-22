@@ -46,6 +46,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -54,8 +55,10 @@ from typing import Any
 import boto3
 from botocore.config import Config
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.text import Text
 
 # AgentCore Runtime streams SSE for the full life of an invocation. A
@@ -82,23 +85,216 @@ err_console = Console(stderr=True, highlight=False)
 
 
 # ---------------------------------------------------------------------------
+# Activity indicator (spinner with live elapsed time)
+# ---------------------------------------------------------------------------
+#
+# The agent has long "silent" stretches — model thinking before
+# emitting the first token, tool calls running for 5-30 s, judge
+# data-plane validation parallel-firing 10 Insights queries. Without
+# any feedback the CLI looks frozen and feels much slower than it
+# actually is. The indicator below shows a ``rich`` spinner with a
+# current-phase label and a live elapsed-seconds counter on every
+# silent stretch, then steps aside the moment the agent emits text
+# or finishes a tool. A daemon thread refreshes the timer twice a
+# second so the user can see the clock move.
+#
+# This is a small ``rich.Live`` region (one line) — well within
+# repaint-safe territory, unlike the earlier "wrap the whole buffer
+# in Live" approach that broke on long content.
+
+
+class ActivityIndicator:
+    """Single-line spinner + label + elapsed-time counter.
+
+    Safe to ``stop()`` repeatedly; ``start(label)`` replaces any
+    running spinner with a new one. Use ``start("thinking")``
+    whenever the agent goes silent (between events), and ``stop()``
+    the instant the agent emits something visible.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._live: Live | None = None
+        self._spinner: Spinner | None = None
+        self._label: str = ""
+        self._start_time: float = 0.0
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, label: str, spinner_name: str = "dots") -> None:
+        self.stop()
+        self._label = label
+        self._start_time = time.time()
+        self._spinner = Spinner(spinner_name, text=self._format(), style="cyan")
+        self._live = Live(
+            self._spinner,
+            console=self._console,
+            refresh_per_second=12,
+            transient=True,
+        )
+        self._live.start()
+        # Daemon thread keeps the elapsed counter ticking even when no
+        # SSE events arrive (the agent is mid-think or mid-tool).
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._tick, daemon=True)
+        self._thread.start()
+
+    def update_label(self, label: str) -> None:
+        """Change the label without restarting the spinner / timer."""
+        self._label = label
+        if self._spinner is not None:
+            self._spinner.update(text=self._format())
+
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._stop_event.set()
+            # No join: thread is daemon and tick interval is short,
+            # avoids any risk of blocking the event loop here.
+            self._thread = None
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._live = None
+            self._spinner = None
+
+    def _tick(self) -> None:
+        # 0.5 s interval matches refresh_per_second=12 well enough
+        # for the timer to look smooth without spamming Console.
+        while not self._stop_event.is_set():
+            if self._spinner is not None:
+                self._spinner.update(text=self._format())
+            self._stop_event.wait(0.5)
+
+    def _format(self) -> Text:
+        elapsed = time.time() - self._start_time
+        line = Text()
+        line.append(self._label, style="bold cyan")
+        line.append(f"  {elapsed:>5.1f}s", style="dim")
+        return line
+
+
+# Single module-level indicator — the SSE handler is sequential, so
+# there's never more than one phase active at a time.
+_activity = ActivityIndicator(console)
+
+
+# ---------------------------------------------------------------------------
+# Tool-result summarizers
+# ---------------------------------------------------------------------------
+#
+# Tool result payloads come back as the JSON the tool returned, wrapped
+# in a Bedrock ``toolResult`` envelope. The previous renderer only
+# showed the byte size, which is unhelpful. The summarizers below
+# inspect the result for well-known fields per tool and produce a
+# short, human-meaningful one-liner ("5 services ranked",
+# "approved (9/10)", "published"). Falls back to byte size for tools
+# we don't have a specific summary for.
+
+
+def _summarize_tool_result(tool_name: str, body_text: str) -> str:
+    """Best-effort one-liner describing what a tool returned.
+
+    ``tool_name`` is the most recent tool name from
+    ``_turn_tool_calls``; ``body_text`` is the concatenated text
+    content of the toolResult block (usually a JSON string). All
+    parsing is wrapped in try/except so a bad payload never breaks
+    the renderer — we just fall back to the byte count.
+    """
+    size = len(body_text)
+    short_size = f"{size:,} b"
+    if not body_text:
+        return short_size
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, ValueError):
+        return short_size
+    if not isinstance(data, dict):
+        return short_size
+
+    # Custom tools (known shapes).
+    if tool_name == "rank_services_by_priority":
+        services = data.get("services") or []
+        if isinstance(services, list):
+            return f"{len(services)} services ranked"
+    if tool_name == "judge_dashboard_quality":
+        verdict = data.get("verdict")
+        score = data.get("score")
+        if verdict is not None and score is not None:
+            return f"{verdict} (score {score})"
+    if tool_name == "get_data_window":
+        if data.get("empty"):
+            return "empty log group"
+        tf = data.get("recommended_time_from")
+        span = data.get("span_minutes")
+        if tf is not None and span is not None:
+            return f"time.from={tf}, span={span} min"
+    if tool_name == "prune_dashboards_to_top_set":
+        kept = len(data.get("kept", []) or [])
+        deleted = len(data.get("deleted", []) or [])
+        return f"kept {kept}, deleted {deleted}"
+    if tool_name == "delete_grafana_dashboard":
+        if data.get("ok"):
+            return f"deleted {data.get('uid', '?')}"
+        return f"failed: {str(data.get('error') or '?')[:60]}"
+    if tool_name == "filter_log_events":
+        # filter_log_events returns a JSON array, not a dict — caught
+        # earlier by the isinstance(data, dict) guard; handled below.
+        pass
+
+    # cw_mcp_describe_log_groups returns log_group_metadata array.
+    log_groups = data.get("log_group_metadata")
+    if isinstance(log_groups, list):
+        return f"{len(log_groups)} log groups"
+
+    # Grafana MCP update_dashboard returns {url, uid, version, ...}.
+    if "uid" in data and "url" in data:
+        return f"published {data['uid']}"
+
+    return short_size
+
+
+def _summarize_tool_result_root(tool_name: str, body_text: str) -> str:
+    """Handle tools whose JSON root is a list (e.g. filter_log_events)."""
+    if not body_text:
+        return "0 events"
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, ValueError):
+        return f"{len(body_text):,} b"
+    if isinstance(data, list):
+        if tool_name == "filter_log_events":
+            return f"{len(data)} events"
+        return f"{len(data)} items"
+    return _summarize_tool_result(tool_name, body_text)
+
+
+# ---------------------------------------------------------------------------
 # Streaming-text renderer
 # ---------------------------------------------------------------------------
 #
-# Assistant text arrives token-by-token over the SSE stream. We write
-# each chunk as plain text directly to the console (no live re-render,
-# so duplication is impossible regardless of buffer size). When the
-# block ends we walk the cursor back over the rows we just printed and
-# replace them with a single ``rich.Markdown`` render of the same
-# content, so bold / lists / code blocks come through formatted while
-# avoiding ``rich.Live``'s known repaint issues on content taller than
-# the terminal.
+# Assistant text arrives token-by-token over the SSE stream. We buffer
+# each chunk silently and render the FULL block as rich Markdown once
+# at block close — so bold, lists, headers, and code blocks render
+# properly without ever needing to walk the cursor back through
+# previously-printed lines. The old approach streamed each chunk live
+# and then tried to re-render as Markdown by writing ``\033[<n>F\033[J``;
+# the row counter drifted on emoji and wrapped lines and ended up
+# wiping previous prompts in REPL mode.
+#
+# Trade-off vs live streaming: prose no longer appears character by
+# character. To keep the experience feeling responsive, the activity
+# spinner updates to ``writing`` once the first text delta of a block
+# arrives, so the user can see the model IS emitting tokens even when
+# the rendered block won't appear until the model closes it. Each new
+# block prints a dim ``↪`` marker as a per-iteration reasoning hint.
 
 _md_buffer: str = ""
-# Number of physical terminal rows we have written for the current
-# in-progress text block — used to ``\033[<n>F`` back up and erase the
-# plain-text stream before the rendered Markdown takes its place.
-_md_rows_printed: int = 0
+# True once the current text block has emitted at least one chunk —
+# used so we only print the "reasoning hint" marker on the FIRST
+# chunk of a new block, not on every delta.
+_md_block_started: bool = False
 
 # Export collector. Every assistant text block closed via ``_md_close``
 # is appended here (in order) so ``--export`` can serialize the cleaned
@@ -110,72 +306,62 @@ _turn_text_blocks: list[str] = []
 _turn_tool_calls: list[str] = []
 
 
-def _terminal_width() -> int:
-    # Falls back to a reasonable default if stdout is not a TTY.
-    return console.size.width or 80
-
-
-def _physical_rows(text: str) -> int:
-    """How many terminal rows a chunk of text will occupy when printed.
-
-    Counts wrapped lines using the current terminal width. Tabs and
-    other control chars are not handled precisely; close enough for
-    the cursor-up cleanup, which only needs to overestimate to be
-    safe.
-    """
-    width = _terminal_width()
-    rows = 0
-    for line in text.split("\n"):
-        # Empty lines still occupy a row.
-        rows += max(1, (len(line) + width - 1) // width)
-    return rows
-
-
 def _md_open() -> None:
-    global _md_buffer, _md_rows_printed
+    global _md_buffer, _md_block_started
     _md_buffer = ""
-    _md_rows_printed = 0
+    _md_block_started = False
 
 
 def _md_append(text: str) -> None:
-    global _md_buffer, _md_rows_printed
+    """Buffer one chunk of assistant text. No live print.
+
+    Streaming the chunk live forced a cursor-walk-back at block close
+    to replace plain text with rendered Markdown, and the row counter
+    drifted on emoji / wrapped lines, wiping previous prompts. We
+    now buffer silently and render the entire block in one shot at
+    ``_md_close``, so the cursor is never touched and rich Markdown
+    (bold / lists / code blocks) renders correctly.
+
+    On the FIRST chunk of a new block we flip the activity spinner
+    label to ``writing`` so the user can see the model is actively
+    emitting tokens — the buffer itself won't be visible until the
+    block closes.
+    """
+    global _md_buffer, _md_block_started
     if not text:
         return
-    if _md_buffer == "" and _md_rows_printed == 0:
-        _md_open()
+    if not _md_block_started:
+        _activity.update_label("✏️  writing")
+        _md_block_started = True
     _md_buffer += text
-    _md_rows_printed += _physical_rows(text)
-    # ``end=""`` + ``soft_wrap=True`` keeps rich from injecting its own
-    # newlines: we want the raw token stream to land verbatim so our
-    # row counter stays accurate.
-    console.print(text, end="", soft_wrap=True, markup=False, highlight=False)
 
 
 def _md_close() -> None:
-    """Replace the streamed plain text with its rendered Markdown form.
+    """Render the buffered block as Markdown statically.
 
-    If nothing was streamed since the last close, this is a no-op.
-    Otherwise we move the cursor up over the rows we wrote, clear from
-    there to the end of the screen, and re-print the buffer once as
-    Markdown.
+    Stops the activity spinner (so it doesn't paint over the
+    Markdown), prints a dim ``↪`` lead-in so each agent iteration is
+    visually scannable, then prints the full block via
+    ``rich.Markdown`` for proper bold / lists / headers / code
+    rendering. Never touches the cursor — terminal history above is
+    preserved.
     """
-    global _md_buffer, _md_rows_printed
+    global _md_buffer, _md_block_started
     if not _md_buffer:
-        _md_rows_printed = 0
+        _md_block_started = False
         return
-    # Snapshot the completed block for --export before we tear the
-    # buffer down. Keeping every block as its own entry preserves the
-    # tool-call boundaries (one block per model round).
     _turn_text_blocks.append(_md_buffer)
-    # Move cursor up over the streamed rows and clear to end of screen.
-    # \033[<n>F = cursor up <n> lines, column 0. \033[J = clear to end.
-    # Guard n>=1 because \033[0F is undefined on some terminals.
-    n = max(1, _md_rows_printed)
-    sys.stdout.write(f"\r\033[{n}F\033[J")
-    sys.stdout.flush()
-    console.print(Markdown(_md_buffer, code_theme="monokai", justify="left"))
+    # The spinner is a one-line rich.Live region; killing it before
+    # printing the Markdown block keeps its transient cleanup from
+    # clipping the first line of the rendered output.
+    _activity.stop()
+    console.print()  # blank line for breathing room
+    console.print("  [dim]↪[/]", highlight=False)
+    console.print(
+        Markdown(_md_buffer, code_theme="monokai", justify="left")
+    )
     _md_buffer = ""
-    _md_rows_printed = 0
+    _md_block_started = False
 
 # ---------------------------------------------------------------------------
 # Discovery + helpers
@@ -353,10 +539,11 @@ def _render_event(payload: Any) -> None:
       tool results once a tool call returns.
     * Control signals like ``init_event_loop`` — skipped.
 
-    Text deltas accumulate in the streaming-text buffer (printed as
-    plain text token-by-token, see _md_append above). Any other event
-    closes the buffer first so the streamed plain text is replaced
-    with its rendered Markdown form before the next event prints.
+    Text deltas stream straight to the console as plain text (see
+    _md_append). Any non-text event closes the current block first
+    so a trailing newline keeps the next event on its own row, but
+    the text itself stays on screen permanently — no cursor walk-
+    back, no risk of wiping earlier prompts.
     """
     if not isinstance(payload, dict):
         return
@@ -368,18 +555,27 @@ def _render_event(payload: Any) -> None:
         # Tool-use block opens here. We print just the name now (no
         # args yet); the args/input arrive as deltas we skip, and the
         # result is rendered when the matching message snapshot lands.
+        # Spinner switches from "thinking" to the tool name so the
+        # user sees what is currently running.
         if "contentBlockStart" in ev:
             _md_close()  # any preceding text block ends before this tool starts
             tu = ev["contentBlockStart"].get("start", {}).get("toolUse", {})
             if tu:
                 name = tu.get("name", "?")
                 _turn_tool_calls.append(name)
+                _activity.stop()
                 console.print(f"  [yellow]⚡[/] [bold cyan]{name}[/]")
+                _activity.start(label=f"⏳ {name}", spinner_name="dots")
             return
 
-        # Incremental deltas. Text deltas feed the streaming-text buffer;
-        # tool-input deltas are ignored (rendering the model assembling
-        # tool args adds noise without value).
+        # Incremental deltas. Text deltas feed the silent buffer
+        # (rendered as Markdown all at once when the block closes);
+        # tool-input deltas are ignored (rendering the model
+        # assembling tool args adds noise without value). The spinner
+        # keeps running through both — ``_md_append`` flips its label
+        # to ``writing`` on the first text chunk so the user can see
+        # the model is actively emitting tokens, and ``_md_close``
+        # stops it before printing the rendered block.
         if "contentBlockDelta" in ev:
             delta = ev["contentBlockDelta"].get("delta", {})
             if "text" in delta:
@@ -387,14 +583,19 @@ def _render_event(payload: Any) -> None:
             return
 
         # End of any content block — explicitly close the markdown
-        # stream so the next event (tool call or stats) draws cleanly.
+        # stream so the next event (tool call or stats) draws cleanly,
+        # and start a "thinking" spinner for the gap until the next
+        # block opens.
         if "contentBlockStop" in ev:
             _md_close()
+            _activity.start(label="thinking", spinner_name="dots")
             return
 
-        # End-of-turn stats.
+        # End-of-turn stats. Stop any in-flight spinner first — the
+        # turn is over.
         if "metadata" in ev:
             _md_close()
+            _activity.stop()
             usage = ev["metadata"].get("usage", {}) or {}
             metrics = ev["metadata"].get("metrics", {}) or {}
             if usage or metrics:
@@ -412,6 +613,7 @@ def _render_event(payload: Any) -> None:
 
         if "messageStop" in ev:
             _md_close()
+            _activity.stop()
             return
         return
 
@@ -432,12 +634,27 @@ def _render_event(payload: Any) -> None:
             tr = block["toolResult"]
             status = tr.get("status", "?")
             body = tr.get("content", []) or []
+            # Tool result closes the per-tool spinner; the next event
+            # will either start streaming text (model produces
+            # response) or open another tool, each of which restarts
+            # its own indicator.
+            _activity.stop()
+            tool_name = _turn_tool_calls[-1] if _turn_tool_calls else "?"
+            body_text = "".join(b.get("text", "") for b in body)
             if status == "success":
-                size = sum(len(b.get("text", "")) for b in body)
-                console.print(f"     [green]✓[/] [dim]{size:,} b[/]")
+                summary = _summarize_tool_result(tool_name, body_text)
+                # Some tools (filter_log_events) return a JSON list at
+                # the root; the dict-based summarizer can't read those.
+                if summary.endswith(" b") and body_text.startswith("["):
+                    summary = _summarize_tool_result_root(tool_name, body_text)
+                console.print(f"     [green]✓[/] [dim]{summary}[/]")
             else:
                 first = body[0].get("text", "")[:200] if body else ""
                 console.print(f"     [bold red]✗[/] [red]{first}[/]")
+            # After a tool result, the model is usually thinking
+            # before either calling another tool or emitting text.
+            # Start the thinking spinner so the user sees activity.
+            _activity.start(label="thinking", spinner_name="dots")
         return
 
 
@@ -512,6 +729,13 @@ def _invoke_once(
     total = 0
     buffer = b""
     interrupted = False
+    # Start the "thinking" spinner immediately so the user sees
+    # activity even while the agent is still cold-starting / loading
+    # context / waiting for its first model response. The spinner
+    # auto-stops on the first text delta or tool call (see
+    # ``_render_event``).
+    if not raw:
+        _activity.start(label="thinking", spinner_name="dots")
     with open(output_path, "wb") as raw_file:
         try:
             for chunk in body.iter_chunks(chunk_size=4096):
@@ -528,6 +752,7 @@ def _invoke_once(
                     _print_block(block)
         except KeyboardInterrupt:
             interrupted = True
+            _activity.stop()
             _md_close()  # flush the partial text block before exiting
             err_console.print(
                 "\n[yellow]⚠ stream interrupted by Ctrl-C[/]"
@@ -535,9 +760,10 @@ def _invoke_once(
         # Flush any tail event that didn't end with a blank line.
         if not raw and buffer.strip():
             _print_block(buffer)
-        # Final safety net: flush any in-flight text block if the
-        # response ended without an explicit contentBlockStop event
-        # for the last text block.
+        # Final safety net: kill any spinner left behind by a stream
+        # that ended without a clean ``messageStop`` / metadata event,
+        # then flush the in-flight text block if any.
+        _activity.stop()
         _md_close()
 
     elapsed = time.time() - t0
