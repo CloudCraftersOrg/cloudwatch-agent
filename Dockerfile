@@ -85,4 +85,11 @@ EXPOSE 8080
 # Run the agent module directly. ``python -m app.main`` triggers the
 # ``if __name__ == "__main__"`` block, which calls ``app.run()`` and
 # starts the BedrockAgentCoreApp HTTP server on 0.0.0.0:8080.
+#
+# Observability note: do NOT wrap with ``opentelemetry-instrument``.
+# The AWS OTEL distro defaults its OTLP exporter to localhost:4317
+# and the AgentCore microVM has no collector there, so every span
+# export blocks until the client timeout. To re-enable traces, set
+# OTEL_EXPORTER_OTLP_ENDPOINT to AgentCore's managed endpoint
+# explicitly before re-introducing the wrapper.
 CMD ["uv", "run", "python", "-m", "app.main"]

@@ -96,6 +96,29 @@ _GRAFANA_TOKEN_TTL_SECONDS = 86400
 # touching tokens belonging to other integrations.
 _AGENT_TOKEN_NAME_PREFIX = "agent-mcp-"
 
+# AMG caps each service account at 10 tokens. Once cleanup of expired
+# tokens has run, if we still have this many of our own tokens lying
+# around we delete the oldest until we drop below it. Leaves room for
+# this cold-start's new token plus one concurrent sibling.
+_QUOTA_RECOVERY_THRESHOLD = 8
+
+
+# Cached EDITOR token for ad-hoc Grafana HTTP calls outside the MCP
+# (currently only ``app/tools/dashboards.py:delete_grafana_dashboard``).
+# Same token the MCP subprocess uses; minting one shared token avoids
+# burning a slot of the per-SA quota for every direct HTTP call.
+_grafana_agent_token: str | None = None
+
+
+def get_grafana_agent_token() -> str | None:
+    """Return the EDITOR Grafana token minted at cold-start, or None.
+
+    ``None`` means the Grafana MCP did not start successfully and the
+    agent has no Grafana credentials at all; callers should surface
+    that to the user rather than retry.
+    """
+    return _grafana_agent_token
+
 
 def _start_grafana_mcp() -> tuple[list, object | None]:
     """Mint an EDITOR token and spawn the mcp-grafana subprocess.
@@ -117,48 +140,83 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
 
     grafana_ctl = boto3.client("grafana", region_name=REGION)
 
-    # Best-effort cleanup: only delete tokens that are ALREADY EXPIRED.
-    # Earlier versions deleted every token sharing our prefix, which
-    # raced with sibling containers: a cold-starting container would
-    # nuke a still-valid token held by another container, and that
-    # container would then 401 on the next dashboard update. Expired
-    # tokens are guaranteed dead, so deleting them is safe and still
-    # frees the per-SA quota slot (AMG caps at ~10 tokens per SA). If
-    # the IAM role lacks ListWorkspaceServiceAccountTokens we log and
-    # move on.
+    # Two-tier cleanup so the per-SA token quota (AMG caps at 10 tokens
+    # per service account) never blocks a cold-start mint:
+    #
+    #   Tier 1 — always safe: delete any of our tokens that are already
+    #     expired. Frees quota slots without affecting any running
+    #     sibling container.
+    #
+    #   Tier 2 — quota recovery: if our tokens still occupy >=
+    #     _QUOTA_RECOVERY_THRESHOLD slots after Tier 1, delete the
+    #     OLDEST ones until we are back below it. This can race with
+    #     a long-lived sibling container that still uses an old token,
+    #     but that risk is bounded: we only kill the oldest, never the
+    #     newest, and only when the quota is actually about to deny
+    #     the next mint. The alternative (let the mint fail, the MCP
+    #     not start, the agent silently lose all grafana_* tools)
+    #     is strictly worse because it has no recovery path short of
+    #     manual ``aws grafana delete-workspace-service-account-token``.
+    #
+    # If the IAM role lacks ListWorkspaceServiceAccountTokens we log
+    # and move on; the mint below may still succeed if there is slack.
     try:
         leftover = grafana_ctl.list_workspace_service_account_tokens(
             workspaceId=GRAFANA_WORKSPACE_ID,
             serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
         ).get("serviceAccountTokens", [])
-        now = datetime.now(UTC)
-        for tok in leftover:
-            if not tok.get("name", "").startswith(_AGENT_TOKEN_NAME_PREFIX):
-                continue
-            expires_at = tok.get("expiresAt")
-            # Skip anything still valid: it may belong to a sibling
-            # container that is currently serving traffic. Missing
-            # expiresAt is treated as "still valid" out of caution.
-            if expires_at is None or expires_at > now:
-                continue
-            try:
-                grafana_ctl.delete_workspace_service_account_token(
-                    workspaceId=GRAFANA_WORKSPACE_ID,
-                    serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
-                    tokenId=tok["id"],
-                )
-                logger.info("Cleaned expired Grafana token: %s", tok["id"])
-            except Exception as del_exc:  # noqa: BLE001
-                logger.debug(
-                    "Could not delete expired token %s: %s",
-                    tok.get("id"),
-                    del_exc,
-                )
     except Exception as list_exc:  # noqa: BLE001
         logger.warning(
             "Could not list existing Grafana tokens (continuing): %s",
             list_exc,
         )
+        leftover = []
+
+    now = datetime.now(UTC)
+    our_tokens = [
+        tok for tok in leftover
+        if tok.get("name", "").startswith(_AGENT_TOKEN_NAME_PREFIX)
+    ]
+
+    def _delete(tok: dict, reason: str) -> bool:
+        try:
+            grafana_ctl.delete_workspace_service_account_token(
+                workspaceId=GRAFANA_WORKSPACE_ID,
+                serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
+                tokenId=tok["id"],
+            )
+            logger.info("Cleaned Grafana token %s (%s)", tok["id"], reason)
+            return True
+        except Exception as del_exc:  # noqa: BLE001
+            logger.debug(
+                "Could not delete Grafana token %s (%s): %s",
+                tok.get("id"),
+                reason,
+                del_exc,
+            )
+            return False
+
+    # Tier 1: expired-only.
+    surviving: list[dict] = []
+    for tok in our_tokens:
+        expires_at = tok.get("expiresAt")
+        if expires_at is not None and expires_at <= now:
+            _delete(tok, "expired")
+        else:
+            surviving.append(tok)
+
+    # Tier 2: oldest-first if we are still near the quota. The
+    # threshold leaves headroom for (this mint) + (one concurrent
+    # sibling cold-start) without immediately re-tripping the quota.
+    while len(surviving) >= _QUOTA_RECOVERY_THRESHOLD:
+        oldest = min(
+            surviving,
+            key=lambda t: t.get("createdAt") or now,
+        )
+        if _delete(oldest, "quota recovery"):
+            surviving.remove(oldest)
+        else:
+            break  # Avoid an infinite loop on persistent delete failures.
 
     try:
         created = grafana_ctl.create_workspace_service_account_token(
@@ -177,6 +235,10 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
 
     token_id = created["serviceAccountToken"]["id"]
     token_key = created["serviceAccountToken"]["key"]
+    # Publish the token so direct HTTP callers (delete_grafana_dashboard)
+    # can reuse it instead of minting a sibling token per call.
+    global _grafana_agent_token
+    _grafana_agent_token = token_key
 
     client = MCPClient(
         lambda: stdio_client(

@@ -1,19 +1,19 @@
-"""Log-reading tool that bypasses Logs Insights.
+"""Direct CloudWatch Logs reads, bypassing Logs Insights.
 
-The agent's main analytics path for logs (describe_log_groups,
-execute_log_insights_query, analyze_log_group, etc.) goes through the
-AWS Labs CloudWatch MCP server (see ``app/mcp_clients.py``), which
-internally uses Logs Insights and therefore inherits its indexing lag.
+Two complementary tools live here:
 
-This module exposes a single complementary tool, ``filter_log_events``,
-that calls the FilterLogEvents API directly (the same path the
-console's "Log events" tab uses). There is no indexing step: events
-become visible as soon as PutLogEvents lands them. Useful when
-Insights returns zero but the console clearly shows events.
+- ``filter_log_events`` — raw, lag-free reads via FilterLogEvents
+  (same path the console's "Log events" tab uses). Visible the instant
+  PutLogEvents lands an event. Use this when Insights returns zero
+  but the console clearly shows events.
+- ``get_data_window`` — returns the actual oldest/newest event
+  timestamps for a log group via DescribeLogStreams, plus a
+  recommended Grafana ``time.from`` value sized to fit the data with
+  a safety buffer. Built specifically so dashboards never publish
+  with a time range that excludes the seeded data.
 
-For aggregations, stats, or wide historical windows, prefer the MCP
-tool ``execute_log_insights_query`` — it is much cheaper on large
-scans.
+For aggregations, stats, or wide historical windows, prefer the AWS
+Labs MCP tool ``cw_mcp_execute_log_insights_query``.
 """
 
 from __future__ import annotations
@@ -86,3 +86,106 @@ def filter_log_events(
         }
         for event in response.get("events", [])
     ]
+
+
+# Safety multiplier applied to the data age when picking the dashboard
+# ``time.from``. If the data spans the last 60 minutes at build time,
+# we set the window to 120 min so a user opening the dashboard up to
+# ~60 minutes after publish still sees the full series. 100 % buffer
+# is enough for normal demo / interactive use without diluting the
+# time axis to the point that the data clusters in a corner.
+_TIME_WINDOW_BUFFER_FACTOR = 2.0
+# Floor and ceiling on the recommended window so we never produce a
+# nonsensically tiny or huge ``now-Xm`` (e.g. on a log group with one
+# stale event from a month ago).
+_TIME_WINDOW_MIN_MINUTES = 60
+_TIME_WINDOW_MAX_MINUTES = 7 * 24 * 60
+
+
+@tool
+def get_data_window(log_group_name: str) -> dict[str, Any]:
+    """Return the actual time span of events in a log group.
+
+    Reads ``firstEventTimestamp`` / ``lastEventTimestamp`` from every
+    stream in the log group and produces a recommended Grafana time
+    range that fits the data with a buffer. The agent MUST call this
+    before building dashboards over a log group — using a guessed
+    ``now-6h`` and hoping for the best is what causes "dashboard
+    publishes but every panel is empty" in this demo.
+
+    Args:
+        log_group_name: log group to inspect, e.g.
+            ``"/cloudwatch-agent/demo"``.
+
+    Returns:
+        Dict with:
+        - ``empty`` (bool): True if the log group has no streams or no
+          events with timestamps. When True, the other fields are
+          either absent or zero — do not build dashboards yet, run the
+          seeds first.
+        - ``oldest_event_iso`` / ``newest_event_iso`` (str): ISO-8601
+          UTC timestamps of the oldest and newest events across all
+          streams.
+        - ``oldest_event_age_minutes`` (int): how long ago the oldest
+          event was, relative to "now" at the moment of this call.
+        - ``span_minutes`` (int): newest - oldest, in minutes.
+        - ``recommended_time_from`` (str): a Grafana ``time.from``
+          value (e.g. ``"now-2h"``) sized to cover the data plus a
+          buffer, clamped to [``now-1h``, ``now-7d``]. Use this
+          verbatim for the dashboard's ``time.from`` field.
+        - ``recommended_time_to`` (str): always ``"now"``.
+    """
+    streams_resp = _logs.describe_log_streams(
+        logGroupName=log_group_name,
+        orderBy="LastEventTime",
+        descending=True,
+        limit=50,
+    )
+    streams = streams_resp.get("logStreams", [])
+
+    first_ts = [s["firstEventTimestamp"] for s in streams if "firstEventTimestamp" in s]
+    last_ts = [s["lastEventTimestamp"] for s in streams if "lastEventTimestamp" in s]
+
+    if not first_ts or not last_ts:
+        return {
+            "empty": True,
+            "oldest_event_iso": None,
+            "newest_event_iso": None,
+            "oldest_event_age_minutes": 0,
+            "span_minutes": 0,
+            "recommended_time_from": f"now-{_TIME_WINDOW_MIN_MINUTES}m",
+            "recommended_time_to": "now",
+        }
+
+    oldest_ms = min(first_ts)
+    newest_ms = max(last_ts)
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+
+    oldest_age_min = max(0, (now_ms - oldest_ms) // 60_000)
+    span_min = max(0, (newest_ms - oldest_ms) // 60_000)
+
+    # Lookback = oldest event age + buffer. A user opening the
+    # dashboard immediately after build needs ``oldest_age_min``;
+    # the buffer factor extends that so opens minutes later still
+    # land inside the window.
+    raw_lookback = int(oldest_age_min * _TIME_WINDOW_BUFFER_FACTOR)
+    lookback_min = max(
+        _TIME_WINDOW_MIN_MINUTES, min(_TIME_WINDOW_MAX_MINUTES, raw_lookback)
+    )
+
+    # Prefer hour-rounded values when the lookback is wide enough that
+    # minute precision is just noise — keeps the JSON readable.
+    if lookback_min >= 120 and lookback_min % 60 == 0:
+        time_from = f"now-{lookback_min // 60}h"
+    else:
+        time_from = f"now-{lookback_min}m"
+
+    return {
+        "empty": False,
+        "oldest_event_iso": datetime.fromtimestamp(oldest_ms / 1000, tz=UTC).isoformat(),
+        "newest_event_iso": datetime.fromtimestamp(newest_ms / 1000, tz=UTC).isoformat(),
+        "oldest_event_age_minutes": int(oldest_age_min),
+        "span_minutes": int(span_min),
+        "recommended_time_from": time_from,
+        "recommended_time_to": "now",
+    }

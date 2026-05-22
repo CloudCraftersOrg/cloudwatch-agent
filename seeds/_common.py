@@ -1,34 +1,22 @@
 """Shared machinery for the demo seeds.
 
-Both week scripts write structured JSON log events into ONE CloudWatch
-Logs log group, using one log stream per simulated service. The agent
-reads them later with ``filter_log_events`` (and ``cw_mcp_*`` Insights
-tools for stats / aggregations).
+Every week script writes structured JSON log events into ONE
+CloudWatch Logs log group, with one log stream per simulated service.
+The agent reads them later via ``filter_log_events`` (lag-free) and
+the ``cw_mcp_*`` Insights tools (for stats and aggregations).
 
-Design decision — no backdating:
+All events are spread uniformly across the last ``WINDOW_MINUTES``
+minutes ending at "now". This keeps both data planes happy — events
+sit strictly after the log group's creationTime so Logs Insights
+indexes them, and FilterLogEvents sees them immediately.
 
-CloudWatch Logs Insights only indexes events whose timestamp is >= the
-log group's ``creationTime``. The earlier "two real weeks" approach
-(events with timestamps 6-13 days in the past) silently broke Insights
-whenever the log group was recreated (a fresh creationTime made every
-backdated event "pre-creation" and thus invisible to Insights, even
-though FilterLogEvents and the Console "Log events" tab still saw them).
+CloudWatch Logs constraints handled here so the week scripts don't
+have to think about them:
 
-To keep both data planes (FilterLogEvents AND Insights) happy and to
-keep the seed dead-simple, we now inject **all events within the last
-``WINDOW_MINUTES`` minutes** — i.e. always strictly after the log
-group's creationTime, regardless of when the log group was created.
-The narrative "two real weeks" is replaced by "two phases of recent
-activity": week1 lays down a baseline, week2 (run later) appends an
-evolution + an incident burst near "now".
-
-CloudWatch Logs constraints handled here so the week scripts don't have
-to think about them:
-
-* A ``PutLogEvents`` batch must be sorted by timestamp, span <= 24h, and
-  stay under 10k events / ~1 MB. Our window is way under 24h, and we
-  chunk under the count/size caps below.
-* Events older than 14 days are rejected by the API. Our window is
+* ``PutLogEvents`` batches must be sorted by timestamp, span <= 24h,
+  and stay under 10k events / ~1 MB. The window is well under 24h
+  and we chunk under the count/size caps below.
+* Events older than 14 days are rejected by the API. The window is
   60 min, so this never trips.
 """
 
@@ -67,11 +55,11 @@ class ServiceProfile:
     """How one service behaves for a given week.
 
     Attributes:
-        per_day: Approximate event count per level per "day" — kept as
-            the field name for backward-compat with existing week*.py
-            specs, but now interpreted as ``events_per_window_per_level``
-            scaled by ``SeedSpec.num_days`` (so the total volume per
-            service stays roughly comparable to the old day-based seed).
+        per_day: Per-level event volume scalar. Total events per
+            (service, level) emitted in one ``run_seed`` call is
+            ``per_day[level] * SeedSpec.num_days`` with +/- 30 %
+            jitter, all spread uniformly across the
+            ``WINDOW_MINUTES`` window.
         templates: Candidate message strings per level.
         status: Candidate HTTP status codes per level.
         latency_ms: ``(low, high)`` latency range per level (ms).
@@ -87,22 +75,13 @@ class ServiceProfile:
 class Incident:
     """A concentrated error burst the agent should be able to find.
 
-    The window is intentionally narrow and the ``error_code`` distinctive
-    so a prompt like "build an incident dashboard for the orders outage"
-    has something unambiguous to visualize.
-
-    With the new seed timing model (everything within the last
-    ``WINDOW_MINUTES``), the incident is a tight burst landing somewhere
-    inside the same window. The legacy ``day_offset``/``start_hour``/
-    ``duration_hours`` fields are kept on the dataclass for backward
-    compatibility with week2.py's existing SPEC but are no longer used —
-    the burst now lasts a fixed ``_INCIDENT_BURST_MINUTES``.
+    The window is intentionally narrow and the ``error_code`` is
+    distinctive so a prompt like "build an incident dashboard for the
+    orders outage" has something unambiguous to visualize. The burst
+    lasts ``_INCIDENT_BURST_MINUTES`` ending at "now".
     """
 
     service: str
-    day_offset: int  # legacy, ignored
-    start_hour: int  # legacy, ignored
-    duration_hours: int  # legacy, ignored
     count: int
     error_code: str
     message: str
@@ -113,8 +92,7 @@ class SeedSpec:
     """Everything a week script needs to declare; the rest is generic."""
 
     name: str
-    start_days_ago: int  # legacy, ignored — kept for week*.py back-compat
-    num_days: int  # interpreted as a volume scalar (see ServiceProfile)
+    num_days: int  # volume scalar applied to per-window event counts
     profiles: dict[str, ServiceProfile]
     incident: Incident | None = None
     # Free-text lines printed after the run to tell the operator exactly
@@ -168,11 +146,11 @@ def _ensure_stream(client, log_group: str, stream: str) -> None:
 
 
 def _put_batch(client, log_group: str, stream: str, batch: list[dict]) -> None:
-    """Send one already-sorted batch, tolerating the modern token model.
+    """Send one already-sorted batch.
 
-    Since 2023 ``PutLogEvents`` no longer requires a sequence token. We
-    omit it; if an older endpoint still complains we retry once with the
-    token it hands back.
+    ``PutLogEvents`` does not require a sequence token on current AWS
+    endpoints; we omit it. If a regional endpoint still complains we
+    retry once with the token it returns.
     """
     try:
         client.put_log_events(
@@ -294,9 +272,8 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
 
         events: list[tuple[int, str]] = []
         for level, mean in profile.per_day.items():
-            # Total event count = (per_day count) * num_days, with the
-            # same +/-30% jitter the old seed used. num_days is now just
-            # a volume scalar (no longer "days").
+            # Total event count = per_day * num_days with +/- 30% jitter.
+            # num_days is a volume scalar, not real days.
             count = max(0, int(mean * spec.num_days * rng.uniform(0.7, 1.3)))
             for _ in range(count):
                 offset_sec = rng.uniform(0, window_seconds)

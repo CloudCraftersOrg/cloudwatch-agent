@@ -2,17 +2,14 @@
 # #############################################################################
 # Build and push the agent container image as part of `terraform apply`.
 #
-# A single `terraform apply` now does the whole deploy:
+# A single `terraform apply` does the whole deploy:
 #   1. Creates / updates the ECR repository (ecr.tf).
 #   2. Builds and pushes the linux/arm64 agent image (this file).
 #   3. Updates the AgentCore Runtime to point at the new image (runtime.tf).
 #
-# This replaces the phased bootstrap (apply -target=ecr → manual docker push
-# → full apply) earlier versions of this stack required. Operator
-# preconditions are the same ones `apply` already needs: docker with buildx,
-# AWS CLI v2, and a working AWS session for the target account. Cross-arch
-# from an amd64 host additionally needs QEMU binfmt (the deploy workflow
-# registers it; on macOS Apple Silicon arm64 is native).
+# Operator preconditions: docker with buildx, AWS CLI v2, and a working AWS
+# session for the target account. Cross-arch from an amd64 host additionally
+# needs QEMU binfmt; on macOS Apple Silicon arm64 is native.
 # #############################################################################
 
 locals {

@@ -25,13 +25,18 @@ cheaper Sonnet/Haiku via env).
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import boto3
 from strands import tool
 
 from app.config import MODEL_ID, REGION
+
+logger = logging.getLogger(__name__)
 
 # Default the judge to the same model as the main agent. Override via
 # JUDGE_MODEL_ID env (e.g. a cheaper Sonnet/Haiku profile) when token
@@ -41,6 +46,29 @@ JUDGE_MODEL_ID: str = os.environ.get("JUDGE_MODEL_ID", MODEL_ID)
 # Module-level Bedrock Runtime client; thread-safe for the read APIs we
 # use (converse is a single round-trip non-streaming call).
 _bedrock = boto3.client("bedrock-runtime", region_name=REGION)
+
+# Reused for the data-validation step. CloudWatch Logs Insights queries
+# are issued per log panel during judging so we can reject dashboards
+# whose queries return zero rows.
+_logs = boto3.client("logs", region_name=REGION)
+
+# Hard upper bound on how long the judge will wait for one Insights
+# query to complete before treating the panel as failed. Insights
+# usually finishes a small query in 2-5 s; 15 s leaves margin for cold
+# Insights and avoids hanging the agent loop on a runaway query.
+_INSIGHTS_QUERY_TIMEOUT_S = 15
+_INSIGHTS_POLL_INTERVAL_S = 1.0
+# Lower bound on the validation window. Even if the dashboard requests
+# something tighter than this, we widen — the goal is to catch "panel
+# will render empty against real data", not to perfectly mirror the
+# dashboard's render time range.
+_MIN_VALIDATION_WINDOW_S = 60 * 60  # 1 hour
+# Max concurrent Insights queries during data-plane validation.
+# AWS allows ~30 concurrent Insights queries per account; we stay
+# well under that since other tooling on the account may also be
+# issuing queries. 10 is enough to drain a 10-panel overview in a
+# single batch with headroom.
+_DATA_PLANE_PARALLELISM = 10
 
 _JUDGE_SYSTEM_PROMPT = """\
 You are a strict reviewer of Grafana dashboard JSON intended for an
@@ -78,13 +106,183 @@ Output rules:
 """.strip()
 
 
+def _parse_relative_time(value: str) -> int:
+    """Convert a Grafana-style relative time (``now-6h``) to seconds.
+
+    Defaults to 1 hour if the value is unrecognized. Only handles the
+    ``now-<int><unit>`` form, which is what the agent emits in
+    practice; absolute timestamps (``2026-05-21T...``) and
+    ``now/d``-style snap expressions are not parsed and fall back to
+    the default so validation still runs against a reasonable window.
+    """
+    if not isinstance(value, str) or not value.startswith("now-"):
+        return _MIN_VALIDATION_WINDOW_S
+    tail = value[len("now-"):]
+    try:
+        if tail.endswith("s"):
+            return max(int(tail[:-1]), _MIN_VALIDATION_WINDOW_S)
+        if tail.endswith("m"):
+            return max(int(tail[:-1]) * 60, _MIN_VALIDATION_WINDOW_S)
+        if tail.endswith("h"):
+            return max(int(tail[:-1]) * 3600, _MIN_VALIDATION_WINDOW_S)
+        if tail.endswith("d"):
+            return max(int(tail[:-1]) * 86400, _MIN_VALIDATION_WINDOW_S)
+    except ValueError:
+        pass
+    return _MIN_VALIDATION_WINDOW_S
+
+
+def _run_insights_query(
+    log_groups: list[str], expression: str, lookback_s: int
+) -> int:
+    """Run a single Logs Insights query and return its row count.
+
+    Raises ``TimeoutError`` if the query does not complete within
+    ``_INSIGHTS_QUERY_TIMEOUT_S``, and ``RuntimeError`` if Insights
+    reports Failed / Cancelled. Callers should catch both and turn
+    them into critique entries.
+    """
+    end_s = int(time.time())
+    start_s = end_s - lookback_s
+    started = _logs.start_query(
+        logGroupNames=log_groups,
+        startTime=start_s,
+        endTime=end_s,
+        queryString=expression,
+        limit=10,
+    )
+    query_id = started["queryId"]
+    deadline = time.time() + _INSIGHTS_QUERY_TIMEOUT_S
+    while time.time() < deadline:
+        time.sleep(_INSIGHTS_POLL_INTERVAL_S)
+        result = _logs.get_query_results(queryId=query_id)
+        status = result.get("status")
+        if status == "Complete":
+            return len(result.get("results", []))
+        if status in {"Failed", "Cancelled", "Timeout"}:
+            raise RuntimeError(f"Insights query ended with status={status}")
+    # Best-effort cancel so we don't leave queries running on the
+    # account. StopQuery is idempotent on already-finished queries.
+    try:
+        _logs.stop_query(queryId=query_id)
+    except Exception:  # noqa: BLE001
+        pass
+    raise TimeoutError(
+        f"Insights query did not complete in {_INSIGHTS_QUERY_TIMEOUT_S}s"
+    )
+
+
+def _check_one_target(
+    title: str,
+    log_groups: list[str],
+    expression: str,
+    lookback_s: int,
+) -> str | None:
+    """Run one log target's query and return a critique string or None.
+
+    Encapsulates the per-target work so the parallel validator can
+    fan it out via a thread pool. Returns ``None`` on success (>=1
+    row), or a one-line critique describing the failure mode.
+    boto3 clients are thread-safe for read APIs, so the module-level
+    ``_logs`` client is shared across workers.
+    """
+    if not log_groups or not expression:
+        return f"panel '{title}': missing logGroupNames or expression."
+    try:
+        rows = _run_insights_query(log_groups, expression, lookback_s)
+    except (TimeoutError, RuntimeError) as exc:
+        return (
+            f"panel '{title}': query failed ({exc}). Expression: "
+            f"{expression[:120]}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return (
+            f"panel '{title}': query error "
+            f"({type(exc).__name__}: {str(exc)[:120]})."
+        )
+    if rows == 0:
+        return (
+            f"panel '{title}': returns 0 rows over the last "
+            f"{lookback_s // 60} min. Widen the time range, relax "
+            f"the filter, or confirm the field/service name exists "
+            f"in the data. Expression: {expression[:120]}"
+        )
+    return None
+
+
+def _validate_log_panels_return_data(dashboard: dict[str, Any]) -> list[str]:
+    """Execute every log-mode panel's query in parallel and report failures.
+
+    Returns one critique string per panel that would render empty or
+    whose query is broken. An empty list means every log target on
+    every panel returned at least one row over the dashboard's
+    declared time range (or a 1 h fallback). Metric panels and
+    panels with no Logs target are skipped — this validation only
+    covers the Insights data plane.
+
+    The per-target queries run concurrently in a thread pool
+    (``_DATA_PLANE_PARALLELISM`` workers) so a dense overview with
+    10+ panels validates in roughly the time of one query instead of
+    N × query-time. boto3's CloudWatch Logs client is documented as
+    thread-safe for the StartQuery / GetQueryResults APIs we use.
+    """
+    lookback_s = _parse_relative_time(
+        (dashboard.get("time") or {}).get("from", "now-1h")
+    )
+
+    # Flatten (panel, target) pairs so each parallel worker handles
+    # one query, even when a panel has multiple targets.
+    work: list[tuple[str, list[str], str]] = []
+    for panel in dashboard.get("panels", []) or []:
+        title = panel.get("title", f"panel_id={panel.get('id', '?')}")
+        for target in panel.get("targets", []) or []:
+            if target.get("queryMode") != "Logs":
+                continue
+            work.append(
+                (
+                    title,
+                    target.get("logGroupNames") or [],
+                    (target.get("expression") or "").strip(),
+                )
+            )
+
+    if not work:
+        return []
+
+    issues: list[str] = []
+    with ThreadPoolExecutor(max_workers=_DATA_PLANE_PARALLELISM) as pool:
+        futures = [
+            pool.submit(_check_one_target, title, lg, expr, lookback_s)
+            for title, lg, expr in work
+        ]
+        for future in futures:
+            result = future.result()
+            if result is not None:
+                issues.append(result)
+    return issues
+
+
 @tool
 def judge_dashboard_quality(dashboard: dict[str, Any] | str) -> dict[str, Any]:
-    """Run an LLM-as-judge over a proposed Grafana dashboard model.
+    """Judge a proposed Grafana dashboard model.
 
-    Call this BEFORE ``grafana_update_dashboard`` to get an automated
-    quality review. Iterate (refine + re-judge) until verdict is
-    ``approve``, then publish.
+    Two-stage gate, in order:
+
+    1. LLM rubric pass — structure, datasource UIDs, queryMode, stable
+       naming, layout, usefulness. Cheap.
+    2. Data-plane validation — for every log panel with
+       ``queryMode == "Logs"``, the judge ACTUALLY RUNS the panel's
+       Logs Insights query against CloudWatch over the dashboard's
+       declared time range (clamped to a 1 h minimum). If any panel
+       returns 0 rows or the query errors, the verdict is overridden
+       to ``revise`` with the specific empty panels in the critique.
+       This catches dashboards that look right but render empty —
+       wrong service filter, time range narrower than the seed window,
+       hallucinated fields, etc. The data check only runs when stage 1
+       returned ``approve``; broken structure is reported first.
+
+    Call this BEFORE ``grafana_update_dashboard``. Iterate (refine +
+    re-judge) until verdict is ``approve``, then publish.
 
     Args:
         dashboard: The Grafana dashboard JSON model. Either a dict
@@ -95,7 +293,8 @@ def judge_dashboard_quality(dashboard: dict[str, Any] | str) -> dict[str, Any]:
         - ``score`` (int, 1-10).
         - ``verdict`` (str: ``approve`` | ``revise`` | ``reject``).
         - ``critique`` (list[str]): concrete issues to fix. Empty when
-          verdict is ``approve``.
+          verdict is ``approve``. Data-plane failures are prefixed
+          ``DATA-PLANE CHECK FAILED`` so they are easy to spot.
         - ``model_id`` (str): which Bedrock model judged.
     """
     # Normalize input to a dict so the judge sees structured JSON.
@@ -157,9 +356,47 @@ def judge_dashboard_quality(dashboard: dict[str, Any] | str) -> dict[str, Any]:
             "model_id": JUDGE_MODEL_ID,
         }
 
-    return {
+    result = {
         "score": int(verdict.get("score", 0)),
         "verdict": str(verdict.get("verdict", "revise")),
         "critique": list(verdict.get("critique", [])),
         "model_id": JUDGE_MODEL_ID,
     }
+
+    # Data-plane validation: only worth running when the LLM thinks the
+    # dashboard is otherwise ready. If the LLM already rejected it for
+    # structural reasons, the agent has plenty to fix and running
+    # Insights queries against a broken dashboard would just add noise.
+    if result["verdict"] == "approve":
+        try:
+            empty_panel_issues = _validate_log_panels_return_data(model)
+        except Exception as exc:  # noqa: BLE001
+            # Validation itself blew up (IAM, network, ...). Fail open
+            # so the agent isn't blocked by a transient infra issue,
+            # but surface it as a critique entry so it's at least
+            # visible in the trace.
+            logger.warning("Dashboard data validation crashed: %s", exc)
+            empty_panel_issues = [
+                f"data-validation step crashed: {type(exc).__name__}: "
+                f"{str(exc)[:160]} (publishing was NOT blocked)."
+            ]
+            result["critique"] = empty_panel_issues + result["critique"]
+        else:
+            if empty_panel_issues:
+                # Override the LLM's verdict: a structurally clean
+                # dashboard with empty panels is still unusable.
+                result["score"] = min(result["score"], 5)
+                result["verdict"] = "revise"
+                result["critique"] = (
+                    [
+                        "DATA-PLANE CHECK FAILED — the following panels "
+                        "would render empty. Fix each one (widen the "
+                        "time range, relax the filter, or use a service "
+                        "name confirmed by a prior tool call) and "
+                        "re-judge:"
+                    ]
+                    + empty_panel_issues[:6]
+                    + result["critique"]
+                )
+
+    return result

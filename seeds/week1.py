@@ -84,7 +84,6 @@ PROFILES: dict[str, ServiceProfile] = {
 
 SPEC = SeedSpec(
     name="week1-baseline",
-    start_days_ago=13,
     num_days=7,
     profiles=PROFILES,
     incident=None,

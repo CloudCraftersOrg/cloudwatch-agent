@@ -154,13 +154,10 @@ PROFILES: dict[str, ServiceProfile] = {
 # Incident: a sharp burst on the NEW risk service. Bigger than the
 # week-2 orders incident (260) — 480 events — because it's the new
 # service melting down and we want the dashboard ranking to be
-# unambiguous. The error_code is distinctive ("Pool exhausted" pattern
-# stays consistent with the week-2 incident vocabulary).
+# unambiguous. The error_code stays in the "Pool exhausted" vocabulary
+# we used for the week-2 incident for continuity.
 INCIDENT = Incident(
     service="risk",
-    day_offset=0,        # legacy, ignored
-    start_hour=0,        # legacy, ignored
-    duration_hours=0,    # legacy, ignored
     count=480,
     error_code="RiskModelInferencePoolExhausted",
     message=(
@@ -171,8 +168,7 @@ INCIDENT = Incident(
 
 SPEC = SeedSpec(
     name="week3-rebalance",
-    start_days_ago=0,    # legacy, ignored
-    num_days=7,          # volume scalar (same as week 1 / week 2)
+    num_days=7,
     profiles=PROFILES,
     incident=INCIDENT,
     notes=[

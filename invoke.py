@@ -52,10 +52,27 @@ from pathlib import Path
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
+
+# AgentCore Runtime streams SSE for the full life of an invocation. A
+# normal turn (1-3 tool calls + a model summary) fits comfortably in
+# 60 s, but Opus 4.6 + a multi-KB tool result + the agent's
+# max_iterations=10 ceiling can stretch a single turn to a few
+# minutes when the model reasons heavily. 300 s is wide enough to see
+# any legitimate turn finish, narrow enough that a runaway loop fails
+# loudly instead of hanging the CLI for 15 minutes. ``max_attempts=1``
+# disables retries — auto-retry on a streaming RPC would re-invoke
+# the agent from scratch, duplicating tool calls and tokens, which is
+# never the right behavior here.
+_RUNTIME_BOTO_CONFIG = Config(
+    connect_timeout=10,
+    read_timeout=300,
+    retries={"max_attempts": 1, "mode": "standard"},
+)
 
 # stdout console for assistant output (tool calls, results, final text).
 # stderr console for the banner / status / errors so the assistant
@@ -68,15 +85,14 @@ err_console = Console(stderr=True, highlight=False)
 # Streaming-text renderer
 # ---------------------------------------------------------------------------
 #
-# The agent's assistant text arrives token-by-token over the SSE stream.
-# Previous versions wrapped the streaming buffer in ``rich.Live`` with a
-# ``Markdown`` widget so bold/lists/code blocks rendered live. That broke
-# badly on long blocks: once the buffer exceeded the terminal height,
-# rich could no longer repaint in place and each refresh re-printed the
-# entire buffer below the prior render, so a 3 KB response appeared 15+
-# times. Now we stream plain text (no live re-render — impossible to
-# duplicate) and, when the block ends, clear the streamed lines and
-# print the same content once more as proper Markdown.
+# Assistant text arrives token-by-token over the SSE stream. We write
+# each chunk as plain text directly to the console (no live re-render,
+# so duplication is impossible regardless of buffer size). When the
+# block ends we walk the cursor back over the rows we just printed and
+# replace them with a single ``rich.Markdown`` render of the same
+# content, so bold / lists / code blocks come through formatted while
+# avoiding ``rich.Live``'s known repaint issues on content taller than
+# the terminal.
 
 _md_buffer: str = ""
 # Number of physical terminal rows we have written for the current
@@ -402,8 +418,16 @@ def _render_event(payload: Any) -> None:
     # --- Tool-result message snapshots ---------------------------------
     if "message" in payload:
         _md_close()
-        for block in payload["message"].get("content", []):
-            if "toolResult" not in block:
+        # Strands also emits envelopes where ``message`` is a plain
+        # string (status/error/control signals — e.g. "force_stop"
+        # reasons). Those don't carry a Bedrock content[] array; treat
+        # them as opaque and skip rendering so the loop doesn't crash
+        # on ``str.get``.
+        message = payload["message"]
+        if not isinstance(message, dict):
+            return
+        for block in message.get("content", []):
+            if not isinstance(block, dict) or "toolResult" not in block:
                 continue  # toolUse blocks are already shown by contentBlockStart
             tr = block["toolResult"]
             status = tr.get("status", "?")
@@ -638,7 +662,11 @@ def _interactive_repl(args, arn: str, session_id: str) -> int:
     except ImportError:
         pass
 
-    client = boto3.client("bedrock-agentcore", region_name=args.region)
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name=args.region,
+        config=_RUNTIME_BOTO_CONFIG,
+    )
     raw = args.raw
 
     err_console.print()
@@ -863,7 +891,11 @@ def main() -> int:
             )
         )
         err_console.print()
-        client = boto3.client("bedrock-agentcore", region_name=args.region)
+        client = boto3.client(
+        "bedrock-agentcore",
+        region_name=args.region,
+        config=_RUNTIME_BOTO_CONFIG,
+    )
         result = _invoke_once(
             client=client,
             arn=arn,

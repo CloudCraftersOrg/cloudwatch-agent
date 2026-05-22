@@ -27,11 +27,65 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
 )
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
+from strands.hooks import BeforeInvocationEvent, BeforeToolCallEvent, HookRegistry
 from strands.models import BedrockModel
 
 from app.config import MEMORY_ID, MODEL_ID, REGION
 from app.prompts import SYSTEM_PROMPT
 from app.tools import TOOLS
+
+
+# Hard cap on tool calls per invocation. Strands' Agent has no native
+# reasoning-loop bound — it loops until the model emits end_turn
+# without a tool_use. Opus 4.6 has been observed to occasionally
+# re-call the same cw_mcp_* tool with the same input after a valid
+# result (suspected: the non-standard ``structuredContent``/``isError``
+# fields the MCP layer adds confuse the model's "did this tool already
+# answer me?" check). Without a cap a single turn can churn through
+# many tool calls and stretch beyond any reasonable client timeout.
+#
+# 35 covers the worst-case canonical-5 rebuild end-to-end:
+#   3 discovery (describe_log_groups + filter_log_events +
+#               get_cloudwatch_datasource)
+# + 1 get_data_window
+# + 1 rank_services_by_priority
+# + 5 dashboards × (1 fetch_version + up to 3 judge cycles + 1 publish)
+# + 1 prune_dashboards_to_top_set
+# = ~30, with ~5 calls of slack for ad-hoc inspection by the model.
+_MAX_TOOL_CALLS_PER_INVOCATION = 35
+
+
+class _ToolCallLimiter:
+    """Strands hook that caps total tool calls in a single invocation.
+
+    Strands invokes ``register_hooks`` once when the agent is built.
+    The counter resets on every ``BeforeInvocationEvent`` so the cap
+    is per-turn, not per-agent-lifetime. ``BeforeToolCallEvent`` is
+    interruptible: setting ``cancel_tool`` short-circuits the tool
+    with an error result the model can read, which lets it wrap up
+    instead of crashing the stream.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._count = 0
+
+    def register_hooks(self, registry: HookRegistry, **_: object) -> None:
+        registry.add_callback(BeforeInvocationEvent, self._on_invocation_start)
+        registry.add_callback(BeforeToolCallEvent, self._on_tool_call)
+
+    def _on_invocation_start(self, _event: BeforeInvocationEvent) -> None:
+        self._count = 0
+
+    def _on_tool_call(self, event: BeforeToolCallEvent) -> None:
+        self._count += 1
+        if self._count > self._limit:
+            event.cancel_tool = (
+                f"Tool-call budget exhausted ({self._limit} calls per "
+                "invocation). Summarize what you already have from prior "
+                "tool results and respond to the user without calling "
+                "any more tools."
+            )
 
 # AgentCore Runtime expects a top-level ``app`` ASGI object listening
 # on port 8080. BedrockAgentCoreApp registers the health-check and
@@ -88,12 +142,14 @@ async def invoke(payload, context):
     # New Agent per invocation (Strands keeps history per instance).
     # Explicit region_name on BedrockModel so model calls always land
     # in the same region as the tools' boto3 clients, even if
-    # AWS_REGION is changed.
+    # AWS_REGION is changed. The ``_ToolCallLimiter`` hook bounds the
+    # reasoning loop — Strands itself has no built-in cap.
     agent = Agent(
         model=BedrockModel(model_id=MODEL_ID, region_name=REGION),
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
         session_manager=session_manager,
+        hooks=[_ToolCallLimiter(limit=_MAX_TOOL_CALLS_PER_INVOCATION)],
     )
 
     # Event filter. stream_async emits two classes of items:

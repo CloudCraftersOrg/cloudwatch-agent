@@ -89,16 +89,11 @@ PROFILES: dict[str, ServiceProfile] = {
     ),
 }
 
-# Sharp, unambiguous orders outage as a tight ERROR burst at the END of
-# the seed window (last ~10 minutes — see _INCIDENT_BURST_MINUTES in
-# seeds/_common.py). day_offset/start_hour/duration_hours are kept for
-# dataclass backward compatibility but are IGNORED by run_seed under
-# the new "recent window" model.
+# Sharp, unambiguous orders outage — a tight ERROR burst at the END of
+# the seed window (last ~10 minutes; see _INCIDENT_BURST_MINUTES in
+# seeds/_common.py).
 INCIDENT = Incident(
     service="orders",
-    day_offset=3,        # legacy, ignored
-    start_hour=14,       # legacy, ignored
-    duration_hours=2,    # legacy, ignored
     count=260,
     error_code="OrderDBConnectionPoolExhausted",
     message="order DB connection pool exhausted; requests timing out",
@@ -106,7 +101,6 @@ INCIDENT = Incident(
 
 SPEC = SeedSpec(
     name="week2-evolved",
-    start_days_ago=7,
     num_days=7,
     profiles=PROFILES,
     incident=INCIDENT,
