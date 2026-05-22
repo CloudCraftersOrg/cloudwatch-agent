@@ -45,15 +45,26 @@ import os
 # tested against other regions during local development if needed.
 REGION: str = os.environ.get("AWS_REGION", "us-east-1")
 
-# Default Bedrock model ID. Uses the cross-region inference profile for
-# Opus 4.6 in the US partition (the ``us.`` prefix). On-demand invocation
-# of the bare foundation model is NOT supported for this model — Bedrock
-# returns ValidationException "Invocation … with on-demand throughput
-# isn't supported. Retry your request with the ID or ARN of an inference
-# profile that contains this model." The profile fans out to us-east-1,
-# us-east-2, and us-west-2, so model access must be enabled in all
-# three (see README Prerequisites).
-MODEL_ID: str = os.environ.get("MODEL_ID", "us.anthropic.claude-opus-4-6-v1")
+# Default Bedrock model ID for the main agent. Cross-region inference
+# profile for Claude Sonnet 4.6 in the US partition (the ``us.``
+# prefix). Sonnet 4.6 is ~2× faster than Opus 4.6 per inference and
+# handles this agent's structured workflow well; pick Opus only when
+# you specifically want its open-ended reasoning depth.
+#
+# On-demand invocation of the bare foundation model is NOT supported
+# — Bedrock returns ValidationException requesting an inference
+# profile instead. The profile fans out to us-east-1, us-east-2,
+# and us-west-2; model access must be enabled in all three (see
+# README Prerequisites).
+#
+# Note on naming: Sonnet 4.6 uses the NEW short ID form
+# (no ``-v1`` / no ``:0``). Older Anthropic models in this codebase
+# (Opus 4.6, Haiku 4.5) still use the longer form. Always copy the
+# exact ID from the model's Bedrock detail page before changing it.
+#
+# To revert to Opus 4.6 (slower, deeper reasoning):
+#   MODEL_ID=us.anthropic.claude-opus-4-6-v1
+MODEL_ID: str = os.environ.get("MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 
 # AgentCore Memory ID. Optional locally so contributors don't need to
 # provision real AWS resources just to iterate on prompts or tool code.

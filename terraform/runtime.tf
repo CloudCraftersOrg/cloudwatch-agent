@@ -32,8 +32,23 @@ resource "aws_bedrockagentcore_agent_runtime" "this" {
   # change here triggers a runtime update (brief cold start).
   environment_variables = {
     AWS_REGION = var.region
-    MODEL_ID   = "us.anthropic.claude-opus-4-6-v1"
-    MEMORY_ID  = aws_bedrockagentcore_memory.this.id
+
+    # Main agent model. Sonnet 4.6 is ~2x faster than Opus 4.6 per
+    # inference and handles the structured discover -> rank ->
+    # build -> judge -> publish workflow well. The ID has no
+    # `-v1` / `:0` suffix - the new short naming AWS adopted with
+    # Sonnet 4.6. To revert to Opus, set
+    # `us.anthropic.claude-opus-4-6-v1` (IAM allows both).
+    MODEL_ID = "us.anthropic.claude-sonnet-4-6"
+    # Judge model. Haiku 4.5 is ~3x faster than Sonnet and ~6x
+    # faster than Opus per inference; the judge only grades a
+    # structured JSON object and drives the (server-side)
+    # data-plane checks, so it does not need bigger reasoning.
+    # Haiku 4.5 still uses the long ID form with date suffix
+    # and `:0` - do NOT shorten it to match Sonnet.
+    JUDGE_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+    MEMORY_ID = aws_bedrockagentcore_memory.this.id
 
     GRAFANA_WORKSPACE_ID              = aws_grafana_workspace.this.id
     GRAFANA_WORKSPACE_ENDPOINT        = aws_grafana_workspace.this.endpoint

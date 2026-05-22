@@ -38,11 +38,20 @@ data "aws_iam_policy_document" "runtime_trust" {
 # the corresponding ARNs.
 data "aws_iam_policy_document" "runtime_permissions" {
 
-  # Main model invocation. Claude Opus 4.6 is inference-profile-only
-  # (the API rejects on-demand against the raw foundation model), so
-  # we point at the us.* profile and at the foundation model with a
-  # region wildcard (the profile fans out to us-east-1, us-east-2,
-  # and us-west-2).
+  # Main model invocation. The agent's default main model is Sonnet
+  # 4.6 and the judge defaults to Haiku 4.5; Opus 4.6 stays on the
+  # allow list as a fallback / override. All three are
+  # inference-profile-only on Bedrock (the API rejects on-demand
+  # against the raw foundation model), so we point at both the us.*
+  # profile ARN and the underlying foundation-model ARN. Exact IDs
+  # come from each model's Bedrock detail page; trailing wildcards
+  # cover minor version revisions when AWS publishes them.
+  #
+  # Naming differs by model generation: Sonnet 4.6 uses the new short
+  # form (no ``-v1`` / no ``:0``), Haiku 4.5 still uses the old long
+  # form with the date suffix and ``:0``, Opus 4.6 sits in between.
+  # Do NOT "normalize" these to match each other — Bedrock rejects
+  # mismatches with ValidationException at ConverseStream time.
   statement {
     sid    = "InvokeBedrockModels"
     effect = "Allow"
@@ -51,6 +60,15 @@ data "aws_iam_policy_document" "runtime_permissions" {
       "bedrock:InvokeModelWithResponseStream",
     ]
     resources = [
+      # Sonnet 4.6 — default main agent model.
+      "arn:aws:bedrock:${local.region}::foundation-model/anthropic.claude-sonnet-4-6*",
+      "arn:aws:bedrock:${local.region}:${local.account_id}:inference-profile/us.anthropic.claude-sonnet-4-6",
+      "arn:aws:bedrock:*::foundation-model/anthropic.claude-sonnet-4-6*",
+      # Haiku 4.5 — default judge model.
+      "arn:aws:bedrock:${local.region}::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+      "arn:aws:bedrock:${local.region}:${local.account_id}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0",
+      # Opus 4.6 — fallback / explicit override.
       "arn:aws:bedrock:${local.region}::foundation-model/anthropic.claude-opus-4-6-v1*",
       "arn:aws:bedrock:${local.region}:${local.account_id}:inference-profile/us.anthropic.claude-opus-4-6-v1",
       "arn:aws:bedrock:*::foundation-model/anthropic.claude-opus-4-6-v1*",

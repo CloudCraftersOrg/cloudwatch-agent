@@ -19,6 +19,7 @@ invocation because Strands keeps history per instance.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 
 from bedrock_agentcore.memory.integrations.strands.config import AgentCoreMemoryConfig
@@ -33,6 +34,18 @@ from strands.models import BedrockModel
 from app.config import MEMORY_ID, MODEL_ID, REGION
 from app.prompts import SYSTEM_PROMPT
 from app.tools import TOOLS
+
+# Logger for invocation-level audit lines. AgentCore Runtime forwards
+# the container's stdout to ``/aws/bedrock-agentcore/runtimes/<id>-DEFAULT``,
+# so anything emitted here is queryable in CloudWatch Logs alongside
+# the agent's response stream. We use a recognizable prefix
+# (``invocation_prompt``) so operators can grep / Insights-filter for
+# prompt traceability without parsing the full container log.
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 
 # Hard cap on tool calls per invocation. Strands' Agent has no native
@@ -136,6 +149,22 @@ async def invoke(payload, context):
     # runtimeSessionId. The fallback is per-invocation: no memory
     # between calls, but the agent does not fail.
     session_id = context.session_id or f"auto-{uuid.uuid4().hex}"
+
+    # Audit log: the inbound user prompt. AgentCore Runtime already
+    # captures the assistant's stream in the container log group; we
+    # add the prompt here so prompt -> response pairs are co-located
+    # under the same session_id and trivially correlatable via a
+    # Logs Insights query like
+    #   filter @message like /invocation_prompt/
+    #   | parse @message "session_id=* user_id=* prompt=*" as sid, uid, p
+    # ``%r`` keeps multi-line prompts on a single log line (repr
+    # escapes newlines) so the JSON-line container log stays clean.
+    logger.info(
+        "invocation_prompt session_id=%s user_id=%s prompt=%r",
+        session_id,
+        user_id,
+        user_message,
+    )
 
     session_manager = _build_session_manager(session_id=session_id, user_id=user_id)
 

@@ -34,14 +34,25 @@ from typing import Any
 import boto3
 from strands import tool
 
-from app.config import MODEL_ID, REGION
+from app.config import REGION
 
 logger = logging.getLogger(__name__)
 
-# Default the judge to the same model as the main agent. Override via
-# JUDGE_MODEL_ID env (e.g. a cheaper Sonnet/Haiku profile) when token
-# cost matters; the IAM policy already allows any anthropic.* model.
-JUDGE_MODEL_ID: str = os.environ.get("JUDGE_MODEL_ID", MODEL_ID)
+# Judge runs against Claude Haiku 4.5 by default. The judge does
+# structural review of a JSON object + (server-side) data-plane
+# validation by running Insights queries; it does not need Sonnet
+# or Opus reasoning depth. Haiku is roughly 3× faster than Sonnet
+# and 5-7× faster than Opus per inference, so with 5-15 judge
+# calls in a typical full-rebuild turn we save 30-60 s.
+#
+# The exact inference-profile ID is taken from the model's Bedrock
+# detail page — Haiku 4.5 still uses the old long form with the
+# date suffix and ``:0``, unlike the newer Sonnet 4.6 (short form).
+# Override via ``JUDGE_MODEL_ID`` if you want to A/B against Sonnet
+# (``us.anthropic.claude-sonnet-4-6``) or Opus.
+JUDGE_MODEL_ID: str = os.environ.get(
+    "JUDGE_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+)
 
 # Module-level Bedrock Runtime client; thread-safe for the read APIs we
 # use (converse is a single round-trip non-streaming call).
