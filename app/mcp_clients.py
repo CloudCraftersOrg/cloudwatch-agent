@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import logging
 import sys
+import threading
 import uuid
 from datetime import UTC, datetime
 
@@ -103,63 +104,100 @@ _AGENT_TOKEN_NAME_PREFIX = "agent-mcp-"
 _QUOTA_RECOVERY_THRESHOLD = 8
 
 
-# Cached EDITOR token for ad-hoc Grafana HTTP calls outside the MCP
-# (currently only ``app/tools/dashboards.py:delete_grafana_dashboard``).
-# Same token the MCP subprocess uses; minting one shared token avoids
-# burning a slot of the per-SA quota for every direct HTTP call.
-_grafana_agent_token: str | None = None
+# Mutable token state shared between the MCP subprocess env, direct
+# HTTP callers (delete_grafana_dashboard), and the refresh path. The
+# MCP transport callable reads from this dict on every (re)start, so
+# bumping the values here is enough to make the next start() pick up
+# a new token without rebuilding the MCPClient instance — which is
+# important because Strands captured the MCPClient reference inside
+# the MCPAgentTool wrappers at agent-init time.
+#
+# ``version`` is bumped on every successful mint so callers that hit a
+# 401 can pass the version they observed; the refresh function then
+# skips a redundant re-mint if a sibling already refreshed.
+_grafana_state: dict[str, object] = {
+    "token_key": None,  # str | None — bearer token used by MCP + direct HTTP
+    "token_id": None,   # str | None — AMG token id, needed to delete on rotate
+    "version": 0,       # int — bumped on every successful mint
+}
+
+# Serializes mint/refresh so concurrent 401s don't all rotate in
+# parallel. Held only across the AMG API calls + MCPClient stop/start;
+# tool calls themselves run outside the lock.
+_grafana_lock = threading.Lock()
+
+# Module-level handles so refresh_grafana_token_and_mcp can drive them
+# without re-discovering state. The boto3 client is cached because
+# building one is non-trivial (resolves region, credentials, etc).
+_grafana_workspace_ctl: object | None = None
+_grafana_mcp_client: MCPClient | None = None
 
 
 def get_grafana_agent_token() -> str | None:
-    """Return the EDITOR Grafana token minted at cold-start, or None.
+    """Return the current EDITOR Grafana token, or None.
 
     ``None`` means the Grafana MCP did not start successfully and the
     agent has no Grafana credentials at all; callers should surface
     that to the user rather than retry.
     """
-    return _grafana_agent_token
+    return _grafana_state["token_key"]  # type: ignore[return-value]
 
 
-def _start_grafana_mcp() -> tuple[list, object | None]:
-    """Mint an EDITOR token and spawn the mcp-grafana subprocess.
+def get_grafana_token_version() -> int:
+    """Return the current token's monotonic version counter.
 
-    Returns ``(tools, cleanup)``. If anything fails (missing env vars,
-    denied token, crashed subprocess) it returns ``([], None)`` after
-    logging a warning, so the rest of the agent stays up.
+    Callers that hit a 401 should capture this BEFORE the failing call
+    and pass it to ``refresh_grafana_token_and_mcp`` so the refresh is
+    a no-op if a sibling already rotated in the meantime.
     """
-    if not (
-        GRAFANA_WORKSPACE_ID
-        and GRAFANA_WORKSPACE_ENDPOINT
-        and GRAFANA_SERVICE_ACCOUNT_ID
-    ):
-        logger.info(
-            "Grafana env vars not set; skipping Grafana MCP startup "
-            "(this is expected in local dev without GRAFANA_* exported)."
+    return _grafana_state["version"]  # type: ignore[return-value]
+
+
+def _grafana_transport():
+    """Build the stdio transport for the mcp-grafana subprocess.
+
+    Reads the current token from ``_grafana_state`` on every call so
+    that ``MCPClient.start()`` after a refresh picks up the new token
+    without needing a new MCPClient instance.
+    """
+    return stdio_client(
+        StdioServerParameters(
+            command="mcp-grafana",
+            # stdio is the default, but we set it explicitly in case a
+            # future version changes the default.
+            args=["-t", "stdio"],
+            env={
+                "GRAFANA_URL": f"https://{GRAFANA_WORKSPACE_ENDPOINT}",
+                "GRAFANA_SERVICE_ACCOUNT_TOKEN": (
+                    _grafana_state["token_key"] or ""  # type: ignore[operator]
+                ),
+            },
         )
-        return [], None
+    )
 
-    grafana_ctl = boto3.client("grafana", region_name=REGION)
 
-    # Two-tier cleanup so the per-SA token quota (AMG caps at 10 tokens
-    # per service account) never blocks a cold-start mint:
-    #
-    #   Tier 1 — always safe: delete any of our tokens that are already
-    #     expired. Frees quota slots without affecting any running
-    #     sibling container.
-    #
-    #   Tier 2 — quota recovery: if our tokens still occupy >=
-    #     _QUOTA_RECOVERY_THRESHOLD slots after Tier 1, delete the
-    #     OLDEST ones until we are back below it. This can race with
-    #     a long-lived sibling container that still uses an old token,
-    #     but that risk is bounded: we only kill the oldest, never the
-    #     newest, and only when the quota is actually about to deny
-    #     the next mint. The alternative (let the mint fail, the MCP
-    #     not start, the agent silently lose all grafana_* tools)
-    #     is strictly worse because it has no recovery path short of
-    #     manual ``aws grafana delete-workspace-service-account-token``.
-    #
-    # If the IAM role lacks ListWorkspaceServiceAccountTokens we log
-    # and move on; the mint below may still succeed if there is slack.
+def _cleanup_old_grafana_tokens(grafana_ctl) -> None:
+    """Two-tier cleanup of orphaned tokens to keep us under the AMG quota.
+
+    Tier 1 — always safe: delete any of our tokens that are already
+        expired. Frees quota slots without affecting any running
+        sibling container.
+
+    Tier 2 — quota recovery: if our tokens still occupy >=
+        ``_QUOTA_RECOVERY_THRESHOLD`` slots after Tier 1, delete the
+        OLDEST ones until we are back below it. This can race with a
+        long-lived sibling container that still uses an old token, but
+        that risk is bounded: we only kill the oldest, never the
+        newest, and only when the quota is actually about to deny the
+        next mint. The alternative (let the mint fail, the MCP not
+        start, the agent silently lose all grafana_* tools) is
+        strictly worse because it has no recovery path short of manual
+        ``aws grafana delete-workspace-service-account-token``.
+
+    If the IAM role lacks ``ListWorkspaceServiceAccountTokens`` we log
+    and move on; the subsequent mint may still succeed if there is
+    slack.
+    """
     try:
         leftover = grafana_ctl.list_workspace_service_account_tokens(
             workspaceId=GRAFANA_WORKSPACE_ID,
@@ -170,7 +208,7 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
             "Could not list existing Grafana tokens (continuing): %s",
             list_exc,
         )
-        leftover = []
+        return
 
     now = datetime.now(UTC)
     our_tokens = [
@@ -196,7 +234,6 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
             )
             return False
 
-    # Tier 1: expired-only.
     surviving: list[dict] = []
     for tok in our_tokens:
         expires_at = tok.get("expiresAt")
@@ -205,19 +242,19 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
         else:
             surviving.append(tok)
 
-    # Tier 2: oldest-first if we are still near the quota. The
-    # threshold leaves headroom for (this mint) + (one concurrent
-    # sibling cold-start) without immediately re-tripping the quota.
     while len(surviving) >= _QUOTA_RECOVERY_THRESHOLD:
-        oldest = min(
-            surviving,
-            key=lambda t: t.get("createdAt") or now,
-        )
+        oldest = min(surviving, key=lambda t: t.get("createdAt") or now)
         if _delete(oldest, "quota recovery"):
             surviving.remove(oldest)
         else:
             break  # Avoid an infinite loop on persistent delete failures.
 
+
+def _mint_grafana_token(grafana_ctl) -> tuple[str, str] | None:
+    """Mint a fresh EDITOR token via the AMG API.
+
+    Returns ``(token_id, token_key)`` on success, ``None`` on failure.
+    """
     try:
         created = grafana_ctl.create_workspace_service_account_token(
             workspaceId=GRAFANA_WORKSPACE_ID,
@@ -227,52 +264,76 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
-            "Failed to mint Grafana service-account token; Grafana MCP "
-            "will be unavailable: %s",
-            exc,
+            "Failed to mint Grafana service-account token: %s", exc,
+        )
+        return None
+    return (
+        created["serviceAccountToken"]["id"],
+        created["serviceAccountToken"]["key"],
+    )
+
+
+def _delete_grafana_token_safe(grafana_ctl, token_id: str) -> None:
+    """Best-effort token delete; swallow errors (token may already be gone)."""
+    try:
+        grafana_ctl.delete_workspace_service_account_token(
+            workspaceId=GRAFANA_WORKSPACE_ID,
+            serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
+            tokenId=token_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not delete Grafana token %s: %s", token_id, exc)
+
+
+def _start_grafana_mcp() -> tuple[list, object | None]:
+    """Mint an EDITOR token and spawn the mcp-grafana subprocess.
+
+    Returns ``(tools, cleanup)``. If anything fails (missing env vars,
+    denied token, crashed subprocess) it returns ``([], None)`` after
+    logging a warning, so the rest of the agent stays up.
+    """
+    if not (
+        GRAFANA_WORKSPACE_ID
+        and GRAFANA_WORKSPACE_ENDPOINT
+        and GRAFANA_SERVICE_ACCOUNT_ID
+    ):
+        logger.info(
+            "Grafana env vars not set; skipping Grafana MCP startup "
+            "(this is expected in local dev without GRAFANA_* exported)."
         )
         return [], None
 
-    token_id = created["serviceAccountToken"]["id"]
-    token_key = created["serviceAccountToken"]["key"]
-    # Publish the token so direct HTTP callers (delete_grafana_dashboard)
-    # can reuse it instead of minting a sibling token per call.
-    global _grafana_agent_token
-    _grafana_agent_token = token_key
+    global _grafana_workspace_ctl, _grafana_mcp_client
+    _grafana_workspace_ctl = boto3.client("grafana", region_name=REGION)
 
-    client = MCPClient(
-        lambda: stdio_client(
-            StdioServerParameters(
-                command="mcp-grafana",
-                # stdio is the default, but we set it explicitly in
-                # case a future version changes the default.
-                args=["-t", "stdio"],
-                env={
-                    "GRAFANA_URL": f"https://{GRAFANA_WORKSPACE_ENDPOINT}",
-                    "GRAFANA_SERVICE_ACCOUNT_TOKEN": token_key,
-                },
-            )
-        ),
-        prefix="grafana",
-    )
+    _cleanup_old_grafana_tokens(_grafana_workspace_ctl)
+
+    minted = _mint_grafana_token(_grafana_workspace_ctl)
+    if minted is None:
+        logger.warning(
+            "Grafana MCP unavailable: token mint failed at cold start."
+        )
+        return [], None
+    token_id, token_key = minted
+    _grafana_state["token_id"] = token_id
+    _grafana_state["token_key"] = token_key
+    _grafana_state["version"] = (_grafana_state["version"] or 0) + 1  # type: ignore[operator]
+
+    _grafana_mcp_client = MCPClient(_grafana_transport, prefix="grafana")
 
     def _cleanup() -> None:
         try:
-            client.stop(None, None, None)
+            if _grafana_mcp_client is not None:
+                _grafana_mcp_client.stop(None, None, None)
         except Exception:  # noqa: BLE001
             pass
-        try:
-            grafana_ctl.delete_workspace_service_account_token(
-                workspaceId=GRAFANA_WORKSPACE_ID,
-                serviceAccountId=GRAFANA_SERVICE_ACCOUNT_ID,
-                tokenId=token_id,
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        current_id = _grafana_state.get("token_id")
+        if current_id:
+            _delete_grafana_token_safe(_grafana_workspace_ctl, current_id)  # type: ignore[arg-type]
 
     try:
-        client.start()
-        tools = client.list_tools_sync()
+        _grafana_mcp_client.start()
+        tools = _grafana_mcp_client.list_tools_sync()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Grafana MCP server failed to start; continuing without it: %s",
@@ -283,6 +344,87 @@ def _start_grafana_mcp() -> tuple[list, object | None]:
 
     logger.info("Grafana MCP server ready (%d tools).", len(tools))
     return tools, _cleanup
+
+
+def refresh_grafana_token_and_mcp(known_version: int) -> int:
+    """Rotate the Grafana token and restart the MCP subprocess.
+
+    Call this when a tool returns 401/Unauthorized. Pass the
+    ``version`` you observed via ``get_grafana_token_version()``
+    BEFORE the failing call so a sibling that already rotated wins the
+    race and we don't burn quota on a redundant re-mint.
+
+    Returns the version after the call. Callers should re-fetch the
+    token with ``get_grafana_agent_token()`` after this returns.
+
+    On any failure (no client to rotate, mint denied, subprocess fails
+    to restart) we log and return the current version unchanged — the
+    agent keeps running with whatever token it had, and the caller's
+    retry will surface the same 401 to the user.
+    """
+    if _grafana_mcp_client is None or _grafana_workspace_ctl is None:
+        logger.warning(
+            "refresh_grafana_token_and_mcp called but Grafana MCP was "
+            "never started; nothing to refresh."
+        )
+        return _grafana_state["version"]  # type: ignore[return-value]
+
+    with _grafana_lock:
+        current_version = _grafana_state["version"]  # type: ignore[assignment]
+        if current_version > known_version:  # type: ignore[operator]
+            # A concurrent caller already rotated. Skip the work; the
+            # caller's retry will use the new token already in state.
+            logger.info(
+                "Grafana token already rotated by sibling (v%d -> v%d); "
+                "skipping redundant refresh.",
+                known_version,
+                current_version,
+            )
+            return current_version  # type: ignore[return-value]
+
+        old_token_id = _grafana_state.get("token_id")
+        logger.info("Rotating Grafana token (v%d -> ?) after 401.", current_version)
+
+        try:
+            _grafana_mcp_client.stop(None, None, None)
+        except Exception as stop_exc:  # noqa: BLE001
+            logger.warning("Stopping Grafana MCP before refresh failed: %s", stop_exc)
+
+        minted = _mint_grafana_token(_grafana_workspace_ctl)
+        if minted is None:
+            logger.warning(
+                "Grafana token refresh failed at mint; MCP stays stopped."
+            )
+            return current_version  # type: ignore[return-value]
+        new_token_id, new_token_key = minted
+
+        _grafana_state["token_id"] = new_token_id
+        _grafana_state["token_key"] = new_token_key
+        _grafana_state["version"] = current_version + 1  # type: ignore[operator]
+
+        try:
+            _grafana_mcp_client.start()
+        except Exception as start_exc:  # noqa: BLE001
+            logger.warning(
+                "Grafana MCP failed to restart after token refresh: %s",
+                start_exc,
+            )
+            # We have a new token in state but no live subprocess; the
+            # next tool call will fail and the user will see it. Don't
+            # bump version backwards — that would only encourage another
+            # mint that would also have nowhere to land.
+            return _grafana_state["version"]  # type: ignore[return-value]
+
+        # Only delete the old token AFTER the new one is live, so a
+        # restart failure doesn't leave us tokenless.
+        if old_token_id:
+            _delete_grafana_token_safe(_grafana_workspace_ctl, old_token_id)  # type: ignore[arg-type]
+
+        logger.info(
+            "Grafana token rotated successfully (now v%d).",
+            _grafana_state["version"],
+        )
+        return _grafana_state["version"]  # type: ignore[return-value]
 
 
 GRAFANA_MCP_TOOLS, _grafana_cleanup = _start_grafana_mcp()

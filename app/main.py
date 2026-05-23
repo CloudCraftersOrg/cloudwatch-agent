@@ -28,10 +28,19 @@ from bedrock_agentcore.memory.integrations.strands.session_manager import (
 )
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
-from strands.hooks import BeforeInvocationEvent, BeforeToolCallEvent, HookRegistry
+from strands.hooks import (
+    AfterToolCallEvent,
+    BeforeInvocationEvent,
+    BeforeToolCallEvent,
+    HookRegistry,
+)
 from strands.models import BedrockModel
 
 from app.config import MEMORY_ID, MODEL_ID, REGION
+from app.mcp_clients import (
+    get_grafana_token_version,
+    refresh_grafana_token_and_mcp,
+)
 from app.prompts import SYSTEM_PROMPT
 from app.tools import TOOLS
 
@@ -99,6 +108,116 @@ class _ToolCallLimiter:
                 "tool results and respond to the user without calling "
                 "any more tools."
             )
+
+
+class _GrafanaUnauthorizedRecovery:
+    """Auto-rotate the Grafana token when a ``grafana_*`` tool returns 401.
+
+    The mcp-grafana subprocess is spawned once at cold start with a
+    token baked into its env. If that token expires (24h TTL) or is
+    deleted by a sibling container's quota-recovery cleanup
+    (see ``app/mcp_clients.py``), every subsequent
+    ``grafana_update_dashboard`` returns
+    ``[POST /dashboards/db][401] postDashboardUnauthorized`` and the
+    canonical-5 dashboard set ends up half-published, blocking the
+    user mid-rebalance.
+
+    This hook plugs that hole without changing the prompt:
+
+    - ``BeforeToolCallEvent`` snapshots the current token version for
+      every ``grafana_*`` call into ``invocation_state`` so we know
+      which token the call ran against.
+    - ``AfterToolCallEvent`` inspects the result; if it contains the
+      ``401`` + ``Unauthorized`` markers, we call
+      ``refresh_grafana_token_and_mcp`` with the snapshot (so siblings
+      that already rotated win the race), then set ``retry = True``
+      to make Strands re-invoke the same tool against the new token.
+
+    Capped at one retry per ``tool_use_id`` — a persistent 401 means
+    a real config problem (revoked SA, IAM denial, wrong workspace),
+    not a stale token, and the user needs to see it.
+    """
+
+    _RETRY_KEY = "_grafana_auth_retries"
+    _VERSION_KEY = "_grafana_token_versions"
+    _MAX_RETRIES_PER_TOOL_USE = 1
+
+    def register_hooks(self, registry: HookRegistry, **_: object) -> None:
+        registry.add_callback(BeforeToolCallEvent, self._on_before_tool)
+        registry.add_callback(AfterToolCallEvent, self._on_after_tool)
+
+    @staticmethod
+    def _is_grafana_tool(selected_tool: object | None) -> bool:
+        if selected_tool is None:
+            return False
+        name = getattr(selected_tool, "tool_name", "")
+        return isinstance(name, str) and name.startswith("grafana_")
+
+    def _on_before_tool(self, event: BeforeToolCallEvent) -> None:
+        if not self._is_grafana_tool(event.selected_tool):
+            return
+        versions = event.invocation_state.setdefault(self._VERSION_KEY, {})
+        versions[event.tool_use["toolUseId"]] = get_grafana_token_version()
+
+    def _on_after_tool(self, event: AfterToolCallEvent) -> None:
+        if not self._is_grafana_tool(event.selected_tool):
+            return
+        if not self._result_is_unauthorized(event.result):
+            return
+
+        retries = event.invocation_state.setdefault(self._RETRY_KEY, {})
+        tool_use_id = event.tool_use["toolUseId"]
+        if retries.get(tool_use_id, 0) >= self._MAX_RETRIES_PER_TOOL_USE:
+            logger.warning(
+                "grafana_* tool %s returned 401 after token refresh; "
+                "letting the error surface to the model.",
+                event.tool_use.get("name"),
+            )
+            return
+
+        snapshot_version = (
+            event.invocation_state.get(self._VERSION_KEY, {}).get(tool_use_id)
+        )
+        if snapshot_version is None:
+            # Missing snapshot — fall back to current version. Worst
+            # case the refresh runs once redundantly; the lock and
+            # version check inside refresh_grafana_token_and_mcp keep
+            # concurrent failures from stampeding.
+            snapshot_version = get_grafana_token_version()
+
+        logger.info(
+            "Detected Grafana 401 on %s (token v%d); rotating token and "
+            "retrying the tool call.",
+            event.tool_use.get("name"),
+            snapshot_version,
+        )
+        refresh_grafana_token_and_mcp(snapshot_version)
+        retries[tool_use_id] = retries.get(tool_use_id, 0) + 1
+        event.retry = True
+
+    @staticmethod
+    def _result_is_unauthorized(result: object) -> bool:
+        """True when a ToolResult content block carries a 401 marker.
+
+        Substring match on ``401`` + ``Unauthorized`` keeps this
+        resilient to minor wording changes in mcp-grafana's error
+        passthrough; the gating to ``grafana_*`` tools above keeps
+        false positives away from unrelated tools.
+        """
+        if result is None:
+            return False
+        try:
+            content = result.get("content") or []  # type: ignore[union-attr]
+        except AttributeError:
+            return False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            text = block.get("text") or ""
+            if isinstance(text, str) and "401" in text and "Unauthorized" in text:
+                return True
+        return False
+
 
 # AgentCore Runtime expects a top-level ``app`` ASGI object listening
 # on port 8080. BedrockAgentCoreApp registers the health-check and
@@ -178,7 +297,10 @@ async def invoke(payload, context):
         system_prompt=SYSTEM_PROMPT,
         tools=TOOLS,
         session_manager=session_manager,
-        hooks=[_ToolCallLimiter(limit=_MAX_TOOL_CALLS_PER_INVOCATION)],
+        hooks=[
+            _ToolCallLimiter(limit=_MAX_TOOL_CALLS_PER_INVOCATION),
+            _GrafanaUnauthorizedRecovery(),
+        ],
     )
 
     # Event filter. stream_async emits two classes of items:

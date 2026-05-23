@@ -32,7 +32,11 @@ from typing import Any
 from strands import tool
 
 from app.config import REGION, require_grafana_config
-from app.mcp_clients import get_grafana_agent_token
+from app.mcp_clients import (
+    get_grafana_agent_token,
+    get_grafana_token_version,
+    refresh_grafana_token_and_mcp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,8 +81,30 @@ def _grafana_api(method: str, path: str) -> tuple[int, str]:
     Returns ``(status_code, body_text)``. Raises ``RuntimeError`` if
     there is no token (the MCP failed to start, so we have no
     credentials) — that case is unrecoverable from a tool call.
+
+    Retries once on 401 after rotating the shared token via
+    ``refresh_grafana_token_and_mcp``. The MCP subprocess hook in
+    ``app/main.py`` handles the same case for grafana_* MCP tools;
+    this path handles direct HTTP callers like
+    ``delete_grafana_dashboard``.
     """
     _, endpoint, _, _ = require_grafana_config()
+
+    def _send(token_value: str) -> tuple[int, str]:
+        req = urllib.request.Request(
+            url=f"https://{endpoint}{path}",
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token_value}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", errors="replace")
+
     token = get_grafana_agent_token()
     if not token:
         raise RuntimeError(
@@ -86,19 +112,25 @@ def _grafana_api(method: str, path: str) -> tuple[int, str]:
             "start successfully at container boot. Check the runtime "
             "logs for the mint failure."
         )
-    req = urllib.request.Request(
-        url=f"https://{endpoint}{path}",
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
+
+    version_before = get_grafana_token_version()
+    status, body = _send(token)
+    if status != 401:
+        return status, body
+
+    logger.info(
+        "Grafana HTTP %s %s returned 401; rotating token and retrying once.",
+        method,
+        path,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status, resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", errors="replace")
+    refresh_grafana_token_and_mcp(version_before)
+    new_token = get_grafana_agent_token()
+    if not new_token or new_token == token:
+        # Refresh didn't actually produce a new token (mint failed, or
+        # we lost the race and the "new" token is also rejected). Let
+        # the caller see the original 401 instead of double-billing.
+        return status, body
+    return _send(new_token)
 
 
 @tool
