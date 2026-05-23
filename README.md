@@ -22,44 +22,7 @@ The agent runs as an HTTPS endpoint behind Amazon Bedrock AgentCore Runtime. It 
 
 ## 2. Architecture
 
-```
-                                  ┌──────────────────────────────┐
-                                  │      Operator's terminal     │
-                                  │       (invoke.py REPL)       │
-                                  └──────────────┬───────────────┘
-                                                 │  HTTPS / SSE
-                                                 ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                       AgentCore Runtime (us-east-1)                        │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  ARM64 microVM, Python 3.13 container, port 8080                     │  │
-│  │  ┌────────────────────────────────────────────────────────────────┐  │  │
-│  │  │  app/main.py — BedrockAgentCoreApp + Strands Agent             │  │  │
-│  │  │   ├─ system prompt (app/prompts.py)                            │  │  │
-│  │  │   ├─ ToolCallLimiter hook (35 calls/invocation cap)            │  │  │
-│  │  │   └─ session_manager → AgentCore Memory                        │  │  │
-│  │  │                                                                │  │  │
-│  │  │  Tool set (Strands):                                           │  │  │
-│  │  │   ├─ Custom    : filter_log_events, get_data_window,           │  │  │
-│  │  │   │              discover_resources, rank_services_by_priority,│  │  │
-│  │  │   │              get_cloudwatch_datasource,                    │  │  │
-│  │  │   │              judge_dashboard_quality,                      │  │  │
-│  │  │   │              delete_grafana_dashboard,                     │  │  │
-│  │  │   │              prune_dashboards_to_top_set                   │  │  │
-│  │  │   ├─ cw_mcp_*  : AWS Labs CloudWatch MCP subprocess (Python)   │  │  │
-│  │  │   └─ grafana_* : Grafana Labs MCP subprocess (Go binary)       │  │  │
-│  │  └────────────────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
-└─────┬─────────────────────┬────────────────────┬──────────────┬────────────┘
-      │                     │                    │              │
-      ▼                     ▼                    ▼              ▼
-┌────────────┐   ┌──────────────────┐   ┌────────────────┐   ┌──────────────┐
-│  Bedrock   │   │   CloudWatch     │   │ AgentCore      │   │   Amazon     │
-│  Runtime   │   │  Logs + Metrics  │   │ Memory + Eval  │   │   Managed    │
-│ (Sonnet,   │   │  + X-Ray Spans   │   │                │   │   Grafana    │
-│   Haiku)   │   │                  │   │                │   │  (workspace) │
-└────────────┘   └──────────────────┘   └────────────────┘   └──────────────┘
-```
+![Architecture](arch.png)
 
 ### 2.1 Container composition
 
