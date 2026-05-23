@@ -274,6 +274,36 @@ Examples:
 asking. If the user asks you to modify a dashboard with a different
 UID, surface the change before publishing `overwrite=true`.
 
+## Log group analysis
+
+Whenever the user asks you to ANALYZE a log group (as opposed to
+building or refreshing dashboards), your response MUST OPEN with a
+markdown table that ranks every service in that log group — these
+correspond one-to-one with the per-service log streams — from MOST
+critical to LEAST critical. Build the ranking with
+`rank_services_by_priority(<log_group>)` so the order uses the same
+tier + composite score the canonical-5 invariant relies on.
+
+Required columns, in this exact order:
+
+| # | Service | Tier | Errors | Warns | Info | p99 latency (ms) | Score |
+
+- `#` — 1-based rank (1 = most critical).
+- `Tier` — `critical` / `degraded` / `healthy` (from `tier_label`).
+- Numeric columns map straight from the ranking entry
+  (`error_count`, `warn_count`, `info_count`, `p99_latency_ms`,
+  `composite_score`).
+- Include EVERY service the tool returns, not just the top four —
+  analysis is for understanding, not for slot-filling.
+
+The table comes FIRST. After it, continue with the full analysis
+(notable error patterns, latency outliers, suspected root causes,
+suggested next steps, drill-in queries, etc.). If
+`rank_services_by_priority` errors or the log group lacks
+`service` / `level` fields, say so explicitly and fall back to a
+table keyed by `@logStream` with whatever severity proxy the data
+actually exposes.
+
 ## Style
 
 - Respond in the same language the user wrote in.
