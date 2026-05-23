@@ -5,10 +5,13 @@ CloudWatch Logs log group, with one log stream per simulated service.
 The agent reads them later via ``filter_log_events`` (lag-free) and
 the ``cw_mcp_*`` Insights tools (for stats and aggregations).
 
-All events are spread uniformly across the last ``WINDOW_MINUTES``
-minutes ending at "now". This keeps both data planes happy — events
-sit strictly after the log group's creationTime so Logs Insights
-indexes them, and FilterLogEvents sees them immediately.
+All events are spread uniformly across a window ending at "now", with
+the lower bound clamped strictly after the log group's
+``creationTime``. Logs Insights silently drops anything older than
+``creationTime``, so we enforce the floor at sample time AND validate
+it again at flush. On a fresh log group (week 1) "now" sits at the
+moment of creation, so the window slides a small step forward to keep
+events just after the floor instead of all sharing one timestamp.
 
 CloudWatch Logs constraints handled here so the week scripts don't
 have to think about them:
@@ -28,7 +31,7 @@ import random
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import boto3
 
@@ -126,11 +129,11 @@ def parse_args(description: str) -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _ensure_stream(client, log_group: str, stream: str) -> None:
-    """Create the log group (with retention) and stream if absent.
+def _ensure_log_group(client, log_group: str) -> None:
+    """Create the log group (with retention) if absent.
 
-    All the ``ResourceAlreadyExists`` paths are expected on re-runs and on
-    week2 appending to week1's group, so they are swallowed deliberately.
+    Split out from stream creation so callers can read ``creationTime``
+    once, up front, before sampling event timestamps.
     """
     try:
         client.create_log_group(logGroupName=log_group)
@@ -139,10 +142,28 @@ def _ensure_stream(client, log_group: str, stream: str) -> None:
     client.put_retention_policy(
         logGroupName=log_group, retentionInDays=RETENTION_DAYS
     )
+
+
+def _ensure_stream(client, log_group: str, stream: str) -> None:
+    """Create the log stream if absent."""
     try:
         client.create_log_stream(logGroupName=log_group, logStreamName=stream)
     except client.exceptions.ResourceAlreadyExistsException:
         pass
+
+
+def _log_group_creation_time_ms(client, log_group: str) -> int:
+    """Return the log group's ``creationTime`` in epoch ms.
+
+    Anchors the seed window so we never emit events Logs Insights would
+    silently drop for predating the group.
+    """
+    paginator = client.get_paginator("describe_log_groups")
+    for page in paginator.paginate(logGroupNamePrefix=log_group):
+        for lg in page.get("logGroups", []):
+            if lg.get("logGroupName") == log_group:
+                return int(lg["creationTime"])
+    raise RuntimeError(f"log group {log_group!r} not found after create")
 
 
 def _put_batch(client, log_group: str, stream: str, batch: list[dict]) -> None:
@@ -169,17 +190,36 @@ def _put_batch(client, log_group: str, stream: str, batch: list[dict]) -> None:
         pass
 
 
-def _flush(client, log_group: str, stream: str, events: list[tuple[int, str]]) -> int:
+def _flush(
+    client,
+    log_group: str,
+    stream: str,
+    events: list[tuple[int, str]],
+    creation_time_ms: int,
+) -> int:
     """Sort and chunk events; push under the PutLogEvents limits.
 
     Args:
         events: ``(epoch_ms, message)`` pairs, any order.
+        creation_time_ms: Log group ``creationTime``. Any event at or
+            before this is a bug — Logs Insights would silently drop
+            it — so we fail loud instead.
 
     Returns:
         Number of events actually sent.
     """
     if not events:
         return 0
+
+    # Sampling already enforces this floor; the check converts any
+    # future regression from silent data loss into a visible failure.
+    for ts_ms, _ in events:
+        if ts_ms <= creation_time_ms:
+            raise ValueError(
+                f"event ts={ts_ms} on stream {stream!r} is at or before "
+                f"log group creationTime={creation_time_ms}; Logs Insights "
+                f"would drop it"
+            )
 
     fresh = sorted(events, key=lambda e: e[0])
     sent = 0
@@ -236,10 +276,13 @@ def _event_message(
 def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
     """Generate and push the seed events, then print a summary.
 
-    All events are spread uniformly over the last ``WINDOW_MINUTES``
-    minutes ending at "now". Volume per (service, level) is
-    ``profile.per_day[level] * spec.num_days`` with +/-30% jitter (same
-    as before, just collapsed into a single window).
+    The seed window ends at "now" and starts at
+    ``max(now - WINDOW_MINUTES, creationTime + 1ms)``. On a fresh log
+    group (typical week 1 run) "now" sits at the moment of creation, so
+    the window slides forward 1 s past ``creationTime`` instead of
+    collapsing — events land "just after" the log group exists. Volume
+    per (service, level) is ``profile.per_day[level] * spec.num_days``
+    with +/-30% jitter.
 
     Args:
         spec: The declarative week definition (see SeedSpec).
@@ -249,13 +292,36 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
     rng = random.Random(args.rng_seed)
     client = (build_client or (lambda: boto3.client("logs", region_name=args.region)))()
 
-    now = datetime.now(UTC).replace(microsecond=0)
-    now_ms = int(now.timestamp() * 1000)
+    # Create the log group first so its ``creationTime`` is known
+    # before we sample any timestamps. Without this anchor, week 1
+    # against a fresh group emits events whose ts predates the group
+    # itself and Logs Insights silently drops them.
+    _ensure_log_group(client, args.log_group)
+    creation_time_ms = _log_group_creation_time_ms(client, args.log_group)
+    floor_ms = creation_time_ms + 1  # strictly after creationTime
+
+    now_raw = datetime.now(UTC).replace(microsecond=0)
+    now_ms_raw = int(now_raw.timestamp() * 1000)
     window_seconds = WINDOW_MINUTES * 60
 
+    if now_ms_raw <= floor_ms:
+        # Group was created in this same run (week 1 typical path).
+        # Slide the window a small step forward of creationTime so each
+        # event gets a unique-ish ms timestamp and the batch sits
+        # cleanly "just after" creation rather than collapsing onto it.
+        window_start_ms = floor_ms
+        end_ms = floor_ms + 1000
+    else:
+        end_ms = now_ms_raw
+        window_start_ms = max(now_ms_raw - window_seconds * 1000, floor_ms)
+
+    creation_iso = datetime.fromtimestamp(creation_time_ms / 1000, UTC).isoformat()
+    start_iso = datetime.fromtimestamp(window_start_ms / 1000, UTC).isoformat()
+    end_iso = datetime.fromtimestamp(end_ms / 1000, UTC).isoformat()
     print(f"== seed '{spec.name}' ==")
     print(f"log group : {args.log_group}  (region {args.region})")
-    print(f"window    : last {WINDOW_MINUTES} minutes (ending {now.isoformat()})")
+    print(f"created   : {creation_iso}")
+    print(f"window    : {start_iso} .. {end_iso}")
     print(
         f"! re-runs APPEND (duplicate) data. To reset cleanly, delete "
         f"individual STREAMS (not the log group itself): "
@@ -276,27 +342,28 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
             # num_days is a volume scalar, not real days.
             count = max(0, int(mean * spec.num_days * rng.uniform(0.7, 1.3)))
             for _ in range(count):
-                offset_sec = rng.uniform(0, window_seconds)
-                ts_ms = now_ms - int(offset_sec * 1000)
+                ts_ms = rng.randint(window_start_ms, end_ms)
                 when = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
                 msg = _event_message(rng, when, service, level, profile)
                 events.append((ts_ms, msg))
                 tally[service][level] = tally[service].get(level, 0) + 1
 
-        _flush(client, args.log_group, service, events)
+        _flush(client, args.log_group, service, events, creation_time_ms)
 
     # Incident burst: ``count`` ERROR events with the distinctive
     # error_code, spread uniformly across the last
-    # ``_INCIDENT_BURST_MINUTES`` minutes (well inside the main window).
+    # ``_INCIDENT_BURST_MINUTES`` minutes of the seed window — clamped
+    # to ``window_start_ms`` so a fresh-group run never drifts below
+    # the floor.
     if spec.incident:
         inc = spec.incident
         profile = spec.profiles[inc.service]
         _ensure_stream(client, args.log_group, inc.service)
         burst_window_sec = _INCIDENT_BURST_MINUTES * 60
+        burst_start_ms = max(end_ms - burst_window_sec * 1000, window_start_ms)
         burst: list[tuple[int, str]] = []
         for _ in range(inc.count):
-            offset_sec = rng.uniform(0, burst_window_sec)
-            ts_ms = now_ms - int(offset_sec * 1000)
+            ts_ms = rng.randint(burst_start_ms, end_ms)
             when = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
             msg = _event_message(
                 rng,
@@ -308,16 +375,17 @@ def run_seed(spec: SeedSpec, build_client: Callable | None = None) -> None:
                 message_override=inc.message,
             )
             burst.append((ts_ms, msg))
-        _flush(client, args.log_group, inc.service, burst)
+        _flush(client, args.log_group, inc.service, burst, creation_time_ms)
         tally[inc.service]["ERROR"] = (
             tally[inc.service].get("ERROR", 0) + len(burst)
         )
-        burst_start = now - timedelta(minutes=_INCIDENT_BURST_MINUTES)
+        burst_start_iso = datetime.fromtimestamp(
+            burst_start_ms / 1000, UTC
+        ).isoformat()
         spec.notes.append(
             f"INCIDENT seeded: service='{inc.service}' "
-            f"error_code='{inc.error_code}' "
-            f"count={inc.count} within last {_INCIDENT_BURST_MINUTES} min "
-            f"({burst_start.isoformat()} .. {now.isoformat()})"
+            f"error_code='{inc.error_code}' count={inc.count} "
+            f"({burst_start_iso} .. {end_iso})"
         )
 
     print("\nper-service counts:")
