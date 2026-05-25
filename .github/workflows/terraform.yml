@@ -2,23 +2,23 @@ name: Terraform Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths:
-      - "app/**"
-      - "terraform/**"
-      - "Dockerfile"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/terraform.yml"
+    - "app/**"
+    - "terraform/**"
+    - "Dockerfile"
+    - "pyproject.toml"
+    - "uv.lock"
+    - ".github/workflows/terraform.yml"
   pull_request:
-    branches: [main]
+    branches: [ main ]
     paths:
-      - "app/**"
-      - "terraform/**"
-      - "Dockerfile"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/terraform.yml"
+    - "app/**"
+    - "terraform/**"
+    - "Dockerfile"
+    - "pyproject.toml"
+    - "uv.lock"
+    - ".github/workflows/terraform.yml"
 
 permissions:
   id-token: write
@@ -41,94 +41,94 @@ jobs:
         working-directory: terraform
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+    - name: Checkout
+      uses: actions/checkout@v5
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_DEV_ROLE_ARN }}
-          aws-region: us-east-1
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6
+      with:
+        role-to-assume: ${{ secrets.AWS_DEV_ROLE_ARN }}
+        aws-region: us-east-1
 
-      # Required so the linux/arm64 image build inside terraform_data.image
-      # (terraform/build.tf) can run on this amd64 runner.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+    # Required so the linux/arm64 image build inside terraform_data.image
+    # (terraform/build.tf) can run on this amd64 runner.
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: "1.9.8"
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v4
+      with:
+        terraform_version: "1.9.8"
 
-      - name: Terraform Init
-        run: terraform init
+    - name: Terraform Init
+      run: terraform init
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
+    - name: Terraform Format Check
+      run: terraform fmt -check -recursive
 
-      - name: Terraform Validate
-        run: terraform validate
+    - name: Terraform Validate
+      run: terraform validate
 
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -no-color -out=tfplan
-        continue-on-error: true
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -no-color -out=tfplan
+      continue-on-error: true
 
-      - name: Comment Plan on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const marker = '<!-- terraform-plan-comment -->';
-            const planOutcome = '${{ steps.plan.outcome }}';
-            const icon = planOutcome === 'success' ? '✅' : '❌';
+    - name: Comment Plan on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v8
+      with:
+        script: |
+          const marker = '<!-- terraform-plan-comment -->';
+          const planOutcome = '${{ steps.plan.outcome }}';
+          const icon = planOutcome === 'success' ? '✅' : '❌';
 
-            const body = [
-              marker,
-              `#### ${icon} Terraform Plan`,
-              '',
-              '<details><summary>Show Plan</summary>',
-              '',
-              '```',
-              `${{ steps.plan.outputs.stdout }}`,
-              '```',
-              '',
-              '</details>',
-              '',
-              `*Triggered by @${{ github.actor }} · \`${{ github.event.pull_request.head.sha }}\`*`,
-            ].join('\n');
+          const body = [
+            marker,
+            `#### ${icon} Terraform Plan`,
+            '',
+            '<details><summary>Show Plan</summary>',
+            '',
+            '```',
+            `${{ steps.plan.outputs.stdout }}`,
+            '```',
+            '',
+            '</details>',
+            '',
+            `*Triggered by @${{ github.actor }} · \`${{ github.event.pull_request.head.sha }}\`*`,
+          ].join('\n');
 
-            const { data: comments } = await github.rest.issues.listComments({
+          const { data: comments } = await github.rest.issues.listComments({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            issue_number: context.issue.number,
+          });
+
+          const existing = comments.find(c => c.body && c.body.includes(marker));
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
+              body,
             });
+          }
 
-            const existing = comments.find(c => c.body && c.body.includes(marker));
+    - name: Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: exit 1
 
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
-
-      - name: Plan Status
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      run: terraform apply -auto-approve tfplan
