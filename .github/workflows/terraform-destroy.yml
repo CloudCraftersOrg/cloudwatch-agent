@@ -56,13 +56,10 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
-      # If the last `terraform apply` was more than 30 days ago, the AMG
-      # service-account token used by the grafana provider has expired
-      # and `destroy` will hang trying to delete the datasource. Rotate
-      # it first so the provider can authenticate during teardown. The
-      # apply -replace is a no-op when the token is still valid.
-      - name: Refresh Grafana provisioner token
-        run: terraform apply -auto-approve -replace=aws_grafana_workspace_service_account_token.terraform
-
+      # NOTE: if the last `terraform apply` was more than 30 days ago,
+      # the AMG provisioner token used by the grafana provider has
+      # expired and this destroy will hang trying to delete the
+      # CloudWatch datasource. Workaround is documented in README §12 —
+      # run it locally before re-triggering this workflow.
       - name: Terraform Destroy
         run: terraform destroy -auto-approve
