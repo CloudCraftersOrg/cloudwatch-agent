@@ -67,8 +67,8 @@ terraform.rc
 *.pem
 *.key
 
-# Claude Code machine-specific settings (shared settings can be committed).
-.claude/settings.local.json
+# Claude Code project directory (settings, transcripts, etc.).
+.claude/
 
 # ###########################################################################
 # Logs

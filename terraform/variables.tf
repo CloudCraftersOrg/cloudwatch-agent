@@ -52,9 +52,9 @@ variable "grafana_admin_group_ids" {
 # their ADMIN role in IaC so it survives a destroy/recreate, instead of
 # relying on a manual console assignment.
 variable "grafana_admin_user_names" {
-  description = "IAM Identity Center user names (e.g. [\"santiacmaestre\"]) to grant Grafana ADMIN. Empty = no per-user admins."
+  description = "IAM Identity Center user names to grant Grafana ADMIN. Empty = no per-user admins."
   type        = list(string)
-  default     = []
+  default     = ["santiacmaestre"]
 }
 
 # Grant the same Grafana role to EVERY IAM Identity Center user in the
@@ -81,10 +81,10 @@ variable "grafana_grant_all_users_role" {
 # aws_identitystore_users) only return results from that home region —
 # calling them from any other region returns an empty list and the
 # auto-grant in grafana.tf errors with "Invalid index ... empty list".
-# Set this to the region where Identity Center was originally enabled
-# (commonly the account's first deploy region). null = use var.region.
+# The deploy account's Identity Center was enabled in us-west-2; the
+# rest of the stack runs in var.region (us-east-1).
 variable "identity_center_region" {
-  description = "Region where the account's IAM Identity Center instance was created. null = same as var.region. Set explicitly when Identity Center is in a different region than the deploy."
+  description = "Region where the account's IAM Identity Center instance was created."
   type        = string
-  default     = null
+  default     = "us-west-2"
 }
