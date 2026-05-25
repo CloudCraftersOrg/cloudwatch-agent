@@ -1,0 +1,68 @@
+name: Terraform Destroy
+
+# Manual-only. Tears down the entire stack via `terraform destroy`.
+# Requires the operator to type "destroy" in the confirmation input so
+# the workflow can't be triggered by an accidental click.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm teardown of the entire stack.'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# Share the deploy concurrency group so a destroy can't race with an
+# in-flight apply (and vice versa).
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Validate confirmation
+        if: inputs.confirm != 'destroy'
+        run: |
+          echo "::error::Confirmation input must be exactly 'destroy' (got '${{ inputs.confirm }}'). Aborting."
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEV_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform Init
+        run: terraform init
+
+      # If the last `terraform apply` was more than 30 days ago, the AMG
+      # service-account token used by the grafana provider has expired
+      # and `destroy` will hang trying to delete the datasource. Rotate
+      # it first so the provider can authenticate during teardown. The
+      # apply -replace is a no-op when the token is still valid.
+      - name: Refresh Grafana provisioner token
+        run: terraform apply -auto-approve -replace=aws_grafana_workspace_service_account_token.terraform
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
