@@ -7,7 +7,7 @@ The agent runs as an HTTPS endpoint behind Amazon Bedrock AgentCore Runtime. It 
 ## 1. Executive summary
 
 | Aspect | What it is |
-|  |  |
+| --- | --- |
 | Goal | Talk to AWS in natural language and get production-ready Grafana dashboards back. |
 | Primary surface | An AgentCore Runtime endpoint invoked by `invoke.py`, a polished CLI REPL. |
 | Reasoning model | `us.anthropic.claude-sonnet-4-6` (cross-region inference profile). |
@@ -27,7 +27,7 @@ The agent runs as an HTTPS endpoint behind Amazon Bedrock AgentCore Runtime. It 
 ### 2.1 Container composition
 
 | Layer | Source | Role |
-|  |  |  |
+| --- | --- | --- |
 | Base image | `python:3.13-slim` (linux/arm64) | Runtime for the agent. |
 | `mcp-grafana` binary | Built from source in a Go `1.24-bookworm` build stage | Provides `grafana_*` tools to Strands. |
 | Python deps | `uv sync --no-dev` against `pyproject.toml` + `uv.lock` | Strands, Bedrock SDK, AWS Labs CW MCP, rich, boto3, etc. |
@@ -48,7 +48,7 @@ The agent does **not** keep a static Grafana token. On every cold start `app/mcp
 AgentCore Memory is configured with three strategies in `terraform/memory.tf`:
 
 | Strategy | What it captures |
-|  |  |
+| --- | --- |
 | **summarization** | Rolling summaries of long sessions so the context window stays bounded. |
 | **user_preference** | Per-user preferences learned across sessions (e.g. preferred dashboard style). |
 | **semantic_facts** | Stable facts the user told the agent (e.g. "we deprecated the payments service"). |
@@ -65,7 +65,7 @@ This is the part that makes the agent's output predictable from one run to the n
 The agent maintains **exactly five canonical dashboards** in the workspace at any time:
 
 | Slot | UID | Title | Source |
-|  |  |  |  |
+| --- | --- | --- | --- |
 | 1 | `cwagent-overview` | `CloudWatch Agent — Overview` | Cross-service summary. Permanent; never displaced. |
 | 2-5 | `cwagent-svc-<service>` | `CloudWatch Agent — <service>` | Per-service deep dive. One per top-4 service from the ranking. |
 
@@ -78,7 +78,7 @@ When the data changes (a new high-error service appears, an old one goes quiet) 
 `rank_services_by_priority` runs one Logs Insights query and assigns each service a **tier** plus a within-tier composite score:
 
 | Tier | Definition | Within-tier score |
-|  |  |  |
+| --- | --- | --- |
 | **1 — critical** | At least one `ERROR` in the window. | `0.5 · error_count + 0.3 · error_rate + 0.2 · p99_latency` (each normalized 0-1). |
 | **2 — degraded** | No errors but at least one `WARN`. | Same formula on warn metrics. |
 | **3 — healthy** | Only `INFO`. | Normalized traffic volume. |
@@ -90,7 +90,7 @@ The tool returns services sorted by `(tier asc, composite_score desc)`. The agen
 When the user asks for "build / regenerate / refresh the dashboard set", the agent follows this exact sequence:
 
 | Step | Action | Tool(s) |
-|  |  |  |
+| --- | --- | --- |
 | 1. Discover | Pick the target log group (from user input or ask). Sample 5 events to learn the field shape. Fetch the CloudWatch datasource UID. | `cw_mcp_describe_log_groups`, `filter_log_events`, `get_cloudwatch_datasource` |
 | 2. Window | Read the actual oldest/newest event timestamps and get a recommended `time.from` value sized to fit the data. | `get_data_window` |
 | 3. Rank | Compute the tiered composite ranking for every service in the log group. | `rank_services_by_priority` |
@@ -104,7 +104,7 @@ No hardcoded "primary" log group: the agent works with whichever log group the u
 The overview must be dense enough to answer "is everything OK right now, and which service is worst?" without clicking into any service dashboard. Minimum panel set (24-column grid):
 
 | Row | y | h | Panels |
-|  |  |  |  |
+| --- | --- | --- | --- |
 | 1 — headline stats | 0 | 4 | total events · total ERRORs · overall error rate % · count of critical-tier services |
 | 2 — cross-service trends | 4 | 8 | request volume by service (stacked, top-4) · ERROR count by service (stacked, top-4) |
 | 3 — health signals | 12 | 8 | p99 latency by service (top-4) · log level distribution (ERROR/WARN/INFO stacked) |
@@ -117,7 +117,7 @@ Every panel uses `queryMode: "Logs"`, the chosen log group, `time.from` from `ge
 Three tags per dashboard, in this order:
 
 | Position | Value | Purpose |
-|  |  |  |
+| --- | --- | --- |
 | 1 | `cloudwatch-agent` (always) | Identifies every agent-owned dashboard. |
 | 2 | `overview` or the lowercase service name | Scope. |
 | 3 | One of `error-warning-info` / `error-warning` / `warning-info` / `error-info` / `error` / `warning` / `info` | Which log levels appear in the dashboard's data. Computed at build time from the ranking output. |
@@ -139,7 +139,7 @@ Runs **before every** `grafana_update_dashboard` call. Two stages:
 Verdict handling:
 
 | Verdict | Score | Agent action |
-|  |  |  |
+| --- | --- | --- |
 | `approve` | ≥ 8 **and** every panel returned data | Publish via `grafana_update_dashboard`. |
 | `revise` | 5-7, **or** any data-plane failure | Apply every critique item, re-judge. Cap: 3 iterations per dashboard. |
 | `reject` | < 5 | Rebuild from scratch using the critique as the spec. Re-judge. |
@@ -155,7 +155,7 @@ Wired by an `awscc_bedrockagentcore_online_evaluation_config` in `terraform/eval
 ### 4.3 Runtime logs and metrics
 
 | Where | What |
-|  |  |
+| --- | --- |
 | `/aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT` | Container stdout/stderr: Python prints, exceptions, MCP boot logs, `invocation_prompt session_id=... prompt=...` audit lines for every request. |
 | `aws/spans` (account-global) | OTLP traces. Source for the AgentCore Evaluator. |
 | `CloudWatch › AWS/BedrockAgentCore` | Invocations, errors, latency, throttles. Native dashboard under AgentCore console → Observability. |
@@ -176,7 +176,7 @@ Strands' `Agent` has no built-in loop bound — it iterates until the model emit
 ### 5.1 AWS account prerequisites
 
 | # | Item | Why |
-|  |  |  |
+| --- | --- | --- |
 | 1 | Bedrock model access for `anthropic.claude-sonnet-4-6` and `anthropic.claude-haiku-4-5-20251001-v1:0`, enabled in **all three** of `us-east-1`, `us-east-2`, `us-west-2` | Both `us.*` inference profiles fan out across these regions; missing access in any one yields `AccessDeniedException` mid-call. Opus 4.6 is also IAM-allowlisted as a fallback if you want to switch back via env var. |
 | 2 | IAM Identity Center enabled in the account | Amazon Managed Grafana requires it for SSO login. If Identity Center's home region differs from the deploy region, set `identity_center_region` in `terraform.tfvars`. |
 | 3 | CloudWatch Transaction Search enabled in the deploy region | Creates the `aws/spans` log group the AgentCore Evaluator reads from. **Manual** step — AWS does not expose a Terraform-friendly API. Toggle from CloudWatch console → Application Signals → Transaction Search → Enable. |
@@ -184,7 +184,7 @@ Strands' `Agent` has no built-in loop bound — it iterates until the model emit
 ### 5.2 Local tooling
 
 | Tool | Version | Purpose |
-|  |  |  |
+| --- | --- | --- |
 | Terraform | ≥ 1.9 | Infrastructure as code. |
 | `uv` | latest | Python venv + dependency resolution. |
 | Docker with buildx | latest | Container build. |
@@ -203,7 +203,7 @@ $EDITOR terraform/terraform.tfvars
 Variables you typically set:
 
 | Variable | Purpose |
-|  |  |
+| --- | --- |
 | `identity_center_region` | Region where IAM Identity Center lives, if different from the deploy region. |
 | `grafana_admin_user_names` | Identity Center user names that get the `ADMIN` role in Grafana (include at least yourself). |
 | `grafana_grant_all_users_role` | Default role for everyone in the identity store (default `VIEWER`; set to `""` to disable auto-grant). |
@@ -268,7 +268,7 @@ A banner panel shows the runtime ARN, session id, user, and command list. Then a
 REPL commands:
 
 | Command | Effect |
-|  |  |
+| --- | --- |
 | `:help` | Show command list. |
 | `:session` | Print the current session id. |
 | `:new` | Rotate to a fresh session id (breaks memory continuity). |
@@ -296,7 +296,7 @@ Writes a JSON session bundle to `./exports/` (configurable via `--export-dir`) w
 ### 6.2 What you see on screen
 
 | Element | When |
-|  |  |
+| --- | --- |
 | `↪` marker | Beginning of each assistant text block (one per agent iteration). |
 | Rendered Markdown (bold, lists, tables, code blocks) | At each block close. The whole block prints at once via `rich.Markdown`. |
 | `⚡ tool_name` | A tool call has just been dispatched. |
@@ -324,7 +324,7 @@ Three seed scripts live in `seeds/`. Each writes structured JSON events into the
 ### 7.1 Data model
 
 | Field | Type | Notes |
-|  |  |  |
+| --- | --- | --- |
 | `timestamp` | ISO-8601 UTC | When the event happened. |
 | `level` | `INFO` / `WARN` / `ERROR` | Severity. |
 | `service` | string | Which simulated service emitted the event. |
@@ -337,7 +337,7 @@ Three seed scripts live in `seeds/`. Each writes structured JSON events into the
 ### 7.2 The three weeks
 
 | Seed | Services touched | Narrative |
-|  |  |  |
+| --- | --- | --- |
 | `week1` | `payments`, `orders`, `auth`, `gateway` | Baseline. `payments` has a recurring `retrying downstream dependency` WARN. |
 | `week2` | + `checkout`, sharp `orders` incident | A new `checkout` service comes online. The week-1 `payments` WARN pattern disappears. A tight burst of `OrderDBConnectionPoolExhausted` lands in the last 10 minutes. |
 | `week3` | + `risk`, + `identity`; `payments` and `auth` deprecated | Two new high-error services come online (`risk` ~65% error rate, `identity` ~45%). `payments` and `auth` collapse to ~1% of their week-2 volume with only deprecation WARNs left. Sharp `RiskModelInferencePoolExhausted` incident. |
@@ -379,7 +379,7 @@ Each script prints a per-service event count summary and a notes section with su
 A 15-minute demo that exercises every layer:
 
 | Time | Action | What to point out |
-|  |  |  |
+| --- | --- | --- |
 | 0:00 | `terraform apply` finished, Grafana workspace is empty | One-command deploy. |
 | 0:30 | `uv run python -m seeds.week1` | Realistic JSON log events seeded into `/cloudwatch-agent/demo`. |
 | 1:00 | `uv run python invoke.py`, prompt: *"Build the canonical dashboard set for /cloudwatch-agent/demo"* | Watch the spinner, tool calls (`⚡ get_data_window`, `⚡ rank_services_by_priority`, `⚡ judge_dashboard_quality`, `⚡ grafana_update_dashboard`), and the final URL list. |
@@ -398,7 +398,7 @@ A 15-minute demo that exercises every layer:
 The defaults are encoded in three places that must stay in sync:
 
 | File | Variable | Default |
-|  |  |  |
+| --- | --- | --- |
 | `app/config.py` | `MODEL_ID` (env-overridable) | `us.anthropic.claude-sonnet-4-6` |
 | `app/tools/judge.py` | `JUDGE_MODEL_ID` (env-overridable) | `us.anthropic.claude-haiku-4-5-20251001-v1:0` |
 | `terraform/runtime.tf` | `MODEL_ID`, `JUDGE_MODEL_ID` env vars on the runtime resource | same as above |
@@ -409,7 +409,7 @@ To swap (e.g. back to Opus 4.6 for the main agent), change the value in `terrafo
 ### 9.2 Granting Grafana access
 
 | Mechanism | Variable | Effect |
-|  |  |  |
+| --- | --- | --- |
 | Per-user ADMIN | `grafana_admin_user_names` | Each listed Identity Store username gets the `ADMIN` role. |
 | Bulk role for everyone | `grafana_grant_all_users_role` | Default `VIEWER`. Set to `EDITOR` to give everyone edit rights, or `""` to disable. Excludes the admin users so they don't collide on lower-priority associations. |
 
@@ -486,7 +486,7 @@ The browser-side SSE viewer is fragile on large responses. The server-side filte
 ## 11. Cost notes
 
 | Component | Driver | Estimate for the demo |
-|  |  |  |
+| --- | --- | --- |
 | Bedrock — Sonnet 4.6 (main agent) | Input + output tokens | A full canonical-5 rebuild ≈ 80-120k tokens total across all model rounds. |
 | Bedrock — Haiku 4.5 (judge) | Input + output tokens | 5-15 judge calls per rebuild × ~3k tokens each. Cheaper than Sonnet by ~5×. |
 | AgentCore Runtime | vCPU-seconds + GB-seconds on the microVM | Negligible at demo traffic. |
