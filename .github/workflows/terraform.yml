@@ -1,15 +1,11 @@
 name: Terraform Deploy
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-    - "app/**"
-    - "terraform/**"
-    - "Dockerfile"
-    - "pyproject.toml"
-    - "uv.lock"
-    - ".github/workflows/terraform.yml"
+  # Create/update is MANUAL. The deploy no longer applies automatically on
+  # merge to main — trigger an apply from the Actions tab ("Run workflow").
+  workflow_dispatch:
+  # PRs still get a read-only plan preview posted as a comment, so changes
+  # can be reviewed before a manual apply. A pull_request run never applies.
   pull_request:
     branches: [ main ]
     paths:
@@ -48,7 +44,7 @@ jobs:
       uses: aws-actions/configure-aws-credentials@v6
       with:
         role-to-assume: ${{ secrets.AWS_DEV_ROLE_ARN }}
-        aws-region: us-east-1
+        aws-region: us-west-2
 
     # Required so the linux/arm64 image build inside terraform_data.image
     # (terraform/build.tf) can run on this amd64 runner.
@@ -129,6 +125,7 @@ jobs:
       if: steps.plan.outcome == 'failure'
       run: exit 1
 
+    # Apply only on a manual dispatch. PR runs stop after plan + comment.
     - name: Terraform Apply
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      if: github.event_name == 'workflow_dispatch'
       run: terraform apply -auto-approve tfplan

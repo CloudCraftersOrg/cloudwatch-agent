@@ -234,14 +234,14 @@ open "$(terraform -chdir=terraform output -raw grafana_workspace_url)"
 
 # Agent endpoint exists
 aws bedrock-agentcore-control list-agent-runtimes \
-  --region us-east-1 \
+  --region us-west-2 \
   --query "agentRuntimes[?starts_with(agentRuntimeName,'cloudwatch_agent')]"
 ```
 
 **Step 5 — Seed demo data.**
 
 ```bash
-uv run python -m seeds.week1 --region us-east-1
+uv run python -m seeds.week1 --region us-west-2
 ```
 
 See section 7 for the full three-week seed narrative.
@@ -355,7 +355,7 @@ CloudWatch Logs Insights only indexes events whose timestamp is later than the l
 ```bash
 for s in payments orders auth gateway checkout risk identity; do
   aws logs delete-log-stream --log-group-name /cloudwatch-agent/demo \
-    --log-stream-name "$s" --region us-east-1 2>/dev/null
+    --log-stream-name "$s" --region us-west-2 2>/dev/null
 done
 ```
 
@@ -364,11 +364,11 @@ Then re-run the seed.
 ### 7.4 Running
 
 ```bash
-uv run python -m seeds.week1 --region us-east-1
+uv run python -m seeds.week1 --region us-west-2
 # ...prompt the agent to build the first dashboard set...
-uv run python -m seeds.week2 --region us-east-1
+uv run python -m seeds.week2 --region us-west-2
 # ...prompt: "regenerate the set; there's a recent orders incident, build a dashboard for it"...
-uv run python -m seeds.week3 --region us-east-1
+uv run python -m seeds.week3 --region us-west-2
 # ...prompt: "rebalance the set; the most critical services should occupy the per-service slots"...
 ```
 
@@ -452,17 +452,17 @@ AMG caps active tokens per service account at ~10. If the container restarts fre
 Manual recovery:
 
 ```bash
-WS_ID=$(aws grafana list-workspaces --region us-east-1 \
+WS_ID=$(aws grafana list-workspaces --region us-west-2 \
   --query "workspaces[?name=='cloudwatch_agent'].id | [0]" --output text)
 SA_ID=$(aws grafana list-workspace-service-accounts \
-  --workspace-id "$WS_ID" --region us-east-1 \
+  --workspace-id "$WS_ID" --region us-west-2 \
   --query "serviceAccounts[?name=='cloudwatch-agent'].id | [0]" --output text)
 for TID in $(aws grafana list-workspace-service-account-tokens \
-    --workspace-id "$WS_ID" --service-account-id "$SA_ID" --region us-east-1 \
+    --workspace-id "$WS_ID" --service-account-id "$SA_ID" --region us-west-2 \
     --query 'serviceAccountTokens[].id' --output text); do
   aws grafana delete-workspace-service-account-token \
     --workspace-id "$WS_ID" --service-account-id "$SA_ID" \
-    --token-id "$TID" --region us-east-1
+    --token-id "$TID" --region us-west-2
 done
 ```
 
@@ -519,8 +519,8 @@ This removes: AgentCore Runtime, Memory, Evaluator, OnlineEvaluationConfig, Graf
 Delete manually if needed:
 
 ```bash
-aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-east-1
-aws logs delete-log-group --log-group-name aws/spans --region us-east-1
+aws logs delete-log-group --log-group-name /cloudwatch-agent/demo --region us-west-2
+aws logs delete-log-group --log-group-name aws/spans --region us-west-2
 ```
 
 ### Stale-token edge case

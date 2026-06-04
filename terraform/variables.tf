@@ -12,12 +12,12 @@ variable "project_name" {
   default     = "cloudwatch-agent"
 }
 
-# AWS region. Single-region project (us-east-1 by default). The variable exists
+# AWS region. Single-region project (us-west-2 by default). The variable exists
 # so contributors can spin up isolated stacks in other regions if needed.
 variable "region" {
   description = "AWS region to deploy into. The agent calls CloudWatch in this same region."
   type        = string
-  default     = "us-east-1"
+  default     = "us-west-2"
 }
 
 # NOTE: the container image tag is no longer a variable. It is derived from
@@ -82,7 +82,9 @@ variable "grafana_grant_all_users_role" {
 # calling them from any other region returns an empty list and the
 # auto-grant in grafana.tf errors with "Invalid index ... empty list".
 # The deploy account's Identity Center was enabled in us-west-2; the
-# rest of the stack runs in var.region (us-east-1).
+# rest of the stack runs in var.region (also us-west-2 by default), so
+# the two regions coincide; the variable still exists so a deploy in
+# another region can point the data sources back at the us-west-2 home.
 variable "identity_center_region" {
   description = "Region where the account's IAM Identity Center instance was created."
   type        = string

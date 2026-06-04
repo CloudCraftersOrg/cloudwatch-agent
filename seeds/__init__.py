@@ -29,6 +29,6 @@ uses as the lower bound for indexing):
 
     for s in payments orders auth gateway checkout risk identity; do
       aws logs delete-log-stream --log-group-name /cloudwatch-agent/demo \\
-        --log-stream-name "$s" --region us-east-1 2>/dev/null
+        --log-stream-name "$s" --region us-west-2 2>/dev/null
     done
 """

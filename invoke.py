@@ -1023,8 +1023,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--region",
-        default="us-east-1",
-        help="AWS region of the runtime (default: us-east-1).",
+        default="us-west-2",
+        help="AWS region of the runtime (default: us-west-2).",
     )
     parser.add_argument(
         "--runtime-name",

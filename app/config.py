@@ -10,7 +10,7 @@ Environment variables
 ---------------------
 AWS_REGION : str, optional
     AWS region used for every boto3 client and for the Bedrock model
-    inference profile prefix. Defaults to ``us-east-1`` because that is
+    inference profile prefix. Defaults to ``us-west-2`` because that is
     the only region this project targets.
 MODEL_ID : str, optional
     Bedrock model identifier passed to the Strands ``Agent``. Defaults
@@ -43,7 +43,7 @@ import os
 # Default AWS region. Hardcoded fallback matches the single region this
 # project targets; the env-var override exists so the same image can be
 # tested against other regions during local development if needed.
-REGION: str = os.environ.get("AWS_REGION", "us-east-1")
+REGION: str = os.environ.get("AWS_REGION", "us-west-2")
 
 # Default Bedrock model ID for the main agent. Cross-region inference
 # profile for Claude Sonnet 4.6 in the US partition (the ``us.``

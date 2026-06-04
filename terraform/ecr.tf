@@ -19,7 +19,7 @@ resource "aws_ecr_repository" "this" {
   image_scanning_configuration {
     scan_on_push = true
   }
-  
+
   # Allow deletion of non-empty repository during terraform destroy to avoid state conflicts.
   force_delete = true
 }
